@@ -905,6 +905,10 @@ The key name follows the current binding of
 (defvar claude-code-ide-review--view nil
   "The open review view, or nil.  One view per Emacs session.")
 
+(defvar claude-code-ide-review--pending-follow nil
+  "(WINDOW . POSITION) a diff window should show first, applied by
+`claude-code-ide-review--follow' from a timer, or nil.")
+
 (defvar claude-code-ide-review-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map "n" #'claude-code-ide-review-next-hunk)
@@ -1250,6 +1254,7 @@ buffer goes; otherwise the view closes and the windows are restored."
     (remove-hook 'ediff-select-hook #'claude-code-ide-review--on-select)
     (remove-hook 'ediff-after-setup-windows-hook #'claude-code-ide-review--after-setup-windows)
     (remove-hook 'window-scroll-functions #'claude-code-ide-review--on-scroll)
+    (setq claude-code-ide-review--pending-follow nil)
     (claude-code-ide-review--unwatch view)
     (dolist (buffer (list (claude-code-ide-review-view-claude-buffer view)
                           (claude-code-ide-review-view-user-buffer view)))
@@ -1297,9 +1302,6 @@ quit."
 
 ;;; View: scroll sync between the diff windows
 
-(defvar claude-code-ide-review--syncing nil
-  "Non-nil while one diff window is being moved to follow the other.")
-
 (defun claude-code-ide-review--line-position (line)
   "Return the position of the start of LINE (1-based) in the current buffer."
   (save-excursion
@@ -1338,23 +1340,39 @@ grows by the hunk's size difference."
             (setq delta (+ delta (- other-count count))))))))
     (max 1 (or result (+ line delta)))))
 
+(defun claude-code-ide-review--follow ()
+  "Show the window in `claude-code-ide-review--pending-follow' from its position.
+Runs from a timer, after the redisplay that scrolled the other window.
+Moving the window from inside `window-scroll-functions' only updates
+its start marker: redisplay has already drawn it, or clears its
+redisplay flag at the end of the cycle, and the screen keeps the old
+text until something else redraws the window.
+
+The start is forced, so redisplay keeps it and moves the window's point
+into view when it was off screen; an optional start would be dropped
+whenever the point was elsewhere, which is the case as soon as only one
+window has been scrolled.  Redisplay then runs the scroll hook for the
+moved window with this start; the window parameter
+`claude-code-ide-review-synced-start' marks it so the hook does not map
+it back, which would snap the scrolled window to a hunk boundary."
+  (when-let* ((pending claude-code-ide-review--pending-follow))
+    (setq claude-code-ide-review--pending-follow nil)
+    (let ((window (car pending))
+          (position (cdr pending)))
+      (when (window-live-p window)
+        (set-window-parameter window 'claude-code-ide-review-synced-start position)
+        (set-window-start window position)))))
+
 (defun claude-code-ide-review--on-scroll (window start)
   "`window-scroll-functions' member: keep ediff windows A and B aligned.
 START is the position WINDOW is about to show first; inside this hook
 `window-start' still returns the old value, so START must be used.
-
-The other window's start is forced, so redisplay keeps it and moves
-that window's point into view when it was off screen.  An optional
-start would be dropped whenever the point was elsewhere, which is the
-case as soon as only one window has been scrolled.  Redisplay then runs
-this hook for the moved window with the start just set; the window
-parameter `claude-code-ide-review-synced-start' marks that start so it
-is not mapped back, which would snap the scrolled window to a hunk
-boundary."
+The hook only records where the other window must go; see
+`claude-code-ide-review--follow' for why the move itself waits for a
+timer."
   (let ((synced (window-parameter window 'claude-code-ide-review-synced-start)))
     (set-window-parameter window 'claude-code-ide-review-synced-start nil)
     (when-let* ((view claude-code-ide-review--view)
-                ((not claude-code-ide-review--syncing))
                 ((not (eql synced start)))
                 (control (claude-code-ide-review-view-control view))
                 ((buffer-live-p control)))
@@ -1363,8 +1381,7 @@ boundary."
              (other (cond ((eq window window-a) window-b)
                           ((eq window window-b) window-a))))
         (when (and (window-live-p other) (window-live-p window))
-          (let* ((claude-code-ide-review--syncing t)
-                 (line (with-current-buffer (window-buffer window)
+          (let* ((line (with-current-buffer (window-buffer window)
                          (line-number-at-pos start)))
                  (target (claude-code-ide-review--map-line
                           (claude-code-ide-review-view-hunks view)
@@ -1373,8 +1390,9 @@ boundary."
                  (position (with-current-buffer (window-buffer other)
                              (claude-code-ide-review--line-position target))))
             (unless (= position (window-start other))
-              (set-window-parameter other 'claude-code-ide-review-synced-start position)
-              (set-window-start other position))))))))
+              (unless claude-code-ide-review--pending-follow
+                (run-at-time 0 nil #'claude-code-ide-review--follow))
+              (setq claude-code-ide-review--pending-follow (cons other position)))))))))
 
 ;;; View: navigation
 

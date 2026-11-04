@@ -3929,31 +3929,41 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                                                                   (position (window line)
                                                                                                     (with-current-buffer (window-buffer window)
                                                                                                       (claude-code-ide-review--line-position line))))
-                                                                                          ;; A shows from baseline line 30: B must show from working line 35
+                                                                                          ;; The hook only records the move; the timer function applies it.
+                                                                                          ;; Nothing moves until the timer function has run.
                                                                                           (claude-code-ide-review--on-scroll window-a (position window-a 30))
+                                                                                          (should (/= (start-line window-b) 35))
+                                                                                          (should claude-code-ide-review--pending-follow)
+                                                                                          ;; A shows from baseline line 30: B must show from working line 35
+                                                                                          (claude-code-ide-review--follow)
+                                                                                          (should-not claude-code-ide-review--pending-follow)
                                                                                           (should (= (start-line window-b) 35))
                                                                                           ;; B shows from working line 41: A must show from baseline line 36
                                                                                           (claude-code-ide-review--on-scroll window-b (position window-b 41))
+                                                                                          (claude-code-ide-review--follow)
                                                                                           (should (= (start-line window-a) 36))
                                                                                           ;; Inside the inserted block B maps to the line before the insertion
                                                                                           (set-window-start window-b (position window-b 13))
                                                                                           (claude-code-ide-review--on-scroll window-b (position window-b 13))
+                                                                                          (claude-code-ide-review--follow)
                                                                                           (should (= (start-line window-a) 10))
                                                                                           ;; Redisplay reports the start just set for A: it must not map back
                                                                                           ;; and snap B to line 10; a later scroll of A to the same place does
                                                                                           (claude-code-ide-review--on-scroll window-a (position window-a 10))
+                                                                                          (should-not claude-code-ide-review--pending-follow)
                                                                                           (should (= (start-line window-b) 13))
                                                                                           (claude-code-ide-review--on-scroll window-a (position window-a 10))
+                                                                                          (claude-code-ide-review--follow)
                                                                                           (should (= (start-line window-b) 10))
                                                                                           ;; Scrolling again from B restores the mapping
                                                                                           (claude-code-ide-review--on-scroll window-b (position window-b 13))
+                                                                                          (claude-code-ide-review--follow)
                                                                                           (should (= (start-line window-a) 10))
-                                                                                          ;; Another window, or a sync already in progress, moves nothing
+                                                                                          ;; A window other than A and B records nothing
                                                                                           (set-window-start window-b (position window-b 50) t)
                                                                                           (claude-code-ide-review--on-scroll (selected-window) 1)
-                                                                                          (should (= (start-line window-b) 50))
-                                                                                          (let ((claude-code-ide-review--syncing t))
-                                                                                            (claude-code-ide-review--on-scroll window-a (position window-a 1)))
+                                                                                          (should-not claude-code-ide-review--pending-follow)
+                                                                                          (claude-code-ide-review--follow)
                                                                                           (should (= (start-line window-b) 50)))))
                                              (should-not (memq #'claude-code-ide-review--on-scroll window-scroll-functions)))))
 
