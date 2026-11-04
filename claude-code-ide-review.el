@@ -1195,6 +1195,7 @@ window is read-only and says so."
     (define-key ediff-mode-map key (lookup-key claude-code-ide-review-mode-map key)))
   (add-hook 'ediff-select-hook #'claude-code-ide-review--on-select)
   (add-hook 'ediff-after-setup-windows-hook #'claude-code-ide-review--after-setup-windows)
+  (add-hook 'window-scroll-functions #'claude-code-ide-review--on-scroll)
   (with-current-buffer (claude-code-ide-review-view-user-buffer view)
     (add-hook 'after-change-functions #'claude-code-ide-review--comment-changed nil t))
   (claude-code-ide-review--update-side-windows view)
@@ -1248,6 +1249,7 @@ buffer goes; otherwise the view closes and the windows are restored."
   (unless (claude-code-ide-review-view-switching view)
     (remove-hook 'ediff-select-hook #'claude-code-ide-review--on-select)
     (remove-hook 'ediff-after-setup-windows-hook #'claude-code-ide-review--after-setup-windows)
+    (remove-hook 'window-scroll-functions #'claude-code-ide-review--on-scroll)
     (claude-code-ide-review--unwatch view)
     (dolist (buffer (list (claude-code-ide-review-view-claude-buffer view)
                           (claude-code-ide-review-view-user-buffer view)))
@@ -1292,6 +1294,72 @@ quit."
           (setf (claude-code-ide-review-view-switching view) nil))
         (claude-code-ide-review--start-ediff view file))
     (claude-code-ide-review--start-ediff view file)))
+
+;;; View: scroll sync between the diff windows
+
+(defvar claude-code-ide-review--syncing nil
+  "Non-nil while one diff window is being moved to follow the other.")
+
+(defun claude-code-ide-review--line-position (line)
+  "Return the position of the start of LINE (1-based) in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (point)))
+
+(defun claude-code-ide-review--map-line (hunks line from)
+  "Return the line in the other file matching LINE in the FROM file.
+FROM is `old' (the baseline, ediff buffer A) or `new' (the working
+file, ediff buffer B).  HUNKS are the file's hunks in file order.
+Before the first hunk lines match one to one; a line inside a hunk maps
+to the hunk's first line on the other side; after each hunk the offset
+grows by the hunk's size difference."
+  (let ((delta 0)
+        (result nil))
+    (dolist (hunk hunks)
+      (unless result
+        (let* ((old-p (eq from 'old))
+               (start (if old-p (claude-code-ide-review-hunk-old-start hunk)
+                        (claude-code-ide-review-hunk-new-start hunk)))
+               (count (if old-p (claude-code-ide-review-hunk-old-count hunk)
+                        (claude-code-ide-review-hunk-new-count hunk)))
+               (other-start (if old-p (claude-code-ide-review-hunk-new-start hunk)
+                              (claude-code-ide-review-hunk-old-start hunk)))
+               (other-count (if old-p (claude-code-ide-review-hunk-new-count hunk)
+                              (claude-code-ide-review-hunk-old-count hunk))))
+          (cond
+           ;; A side of count 0 owns no lines: git reports the line before
+           ;; the gap, which lies before the hunk and maps by offset
+           ((or (< line start) (and (= count 0) (= line start)))
+            (setq result (+ line delta)))
+           ((<= line (claude-code-ide-review--range-end start count))
+            (setq result (max 1 other-start)))
+           (t
+            (setq delta (+ delta (- other-count count))))))))
+    (max 1 (or result (+ line delta)))))
+
+(defun claude-code-ide-review--on-scroll (window start)
+  "`window-scroll-functions' member: keep ediff windows A and B aligned.
+START is the position WINDOW is about to show first; inside this hook
+`window-start' still returns the old value, so START must be used."
+  (when-let* ((view claude-code-ide-review--view)
+              ((not claude-code-ide-review--syncing))
+              (control (claude-code-ide-review-view-control view))
+              ((buffer-live-p control)))
+    (let* ((window-a (buffer-local-value 'ediff-window-A control))
+           (window-b (buffer-local-value 'ediff-window-B control))
+           (other (cond ((eq window window-a) window-b)
+                        ((eq window window-b) window-a))))
+      (when (and (window-live-p other) (window-live-p window))
+        (let* ((claude-code-ide-review--syncing t)
+               (line (with-current-buffer (window-buffer window)
+                       (line-number-at-pos start)))
+               (target (claude-code-ide-review--map-line
+                        (claude-code-ide-review-view-hunks view)
+                        line
+                        (if (eq window window-a) 'old 'new))))
+          (with-current-buffer (window-buffer other)
+            (set-window-start other (claude-code-ide-review--line-position target) t)))))))
 
 ;;; View: navigation
 

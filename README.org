@@ -134,7 +134,7 @@ The easiest way to interact with Claude Code IDE is through the transient menu i
 | =M-x claude-code-ide-review-menu=         | Open the review submenu                           |
 | =M-x claude-code-ide-emacs-tools-setup=   | Set up built-in MCP tools (e.g. xref, project)    |
 | =M-x claude-code-ide-review-setup=        | Set up the review tools and slash command         |
-| =M-x claude-code-ide-review-open=         | Review Claude's edits in four panes (=C-u=: file) |
+| =M-x claude-code-ide-review-open=         | Review Claude's edits in ediff (=C-u=: pick file) |
 | =M-x claude-code-ide-review-finish=       | Send your review comments to Claude               |
 | =M-x claude-code-ide-review-mark-baseline= | Start a fresh review from the current files      |
 | =M-x claude-code-ide=                     | Start a new Claude Code instance for the project  |
@@ -207,14 +207,17 @@ This allows you to refine Claude's suggestions before they're applied, ensuring 
 
 ** Reviewing Claude's Edits
 
-The review view shows every change made to a file since a baseline, together with Claude's reason for each change and your comments on it, in four panes that scroll together:
+The review view shows every change made to a file since a baseline, together with Claude's reason for each change and your comments on it. It is an =ediff= session with two short windows added below the diff:
 
-| Pane         | Content                                                | Editable               |
-|--------------+--------------------------------------------------------+------------------------|
-| top left     | The file as it was at the baseline                     | no                     |
-| top right    | The file as it is on disk now                          | no                     |
-| bottom left  | Claude's justification for each change (hunk)          | no                     |
-| bottom right | Your comment on each hunk                              | the current hunk only  |
+| Window       | Content                                                        | Editable |
+|--------------+----------------------------------------------------------------+----------|
+| top left     | The file as it was at the baseline (ediff buffer A)            | no       |
+| top right    | The file as it is now (ediff buffer B, the file's own buffer)  | yes      |
+| bottom left  | Claude's justification for the current change (hunk)           | no       |
+| bottom right | Your comment on the current hunk                               | yes      |
+| last line    | ediff's control window                                          |          |
+
+The two diff windows show the whole file with ediff's highlighting and scroll together: moving one, with the wheel, =C-v= or anything else, moves the other to the matching line. The bottom windows follow the current difference; their height is =claude-code-ide-review-comment-lines=.
 
 The flow is: enable the feature once, let Claude work, open the review, read each hunk with its justification, type comments where you disagree, and send the comments back to Claude in one prompt.
 
@@ -230,21 +233,25 @@ This enables the Emacs MCP tools server (=claude-code-ide-enable-mcp-server=) an
 
 Ask Claude to open the review, type =/emacs-tools:review=, or run =M-x claude-code-ide-review-open= (=C-u= picks the file). The view takes a new tab when =tab-bar-mode= is on, otherwise it replaces the current window layout until you quit.
 
-| Panes 0 to 2 | Comment pane | Action                                              |
-|--------------+--------------+-----------------------------------------------------|
-| =n=            | =C-c C-n=      | Next hunk                                           |
-| =p=            | =C-c C-p=      | Previous hunk                                       |
-| =e=            | =C-c C-e=      | Put the current hunk in Claude's prompt (to ask about it) |
-| =f=            | =C-c C-f=      | Send all your comments to Claude                    |
-| =g=            | =C-c C-g=      | Rebuild the panes from disk                         |
-| =o=            | =C-c C-o=      | Show another changed file                           |
-| =q=            | =C-c C-q=      | Quit the review                                     |
+Keys in the control window (bottom line) and in the justification window:
 
-The comment pane accepts text only in the current hunk's block; move with =n= and =p= to comment on another hunk. Comments are kept in memory for the project, so switching files or rebuilding does not lose them, but closing Emacs does.
+| Key          | Comment window | Action                                                    |
+|--------------+----------------+-----------------------------------------------------------|
+| =n= / =p=        | =C-c C-n= / =C-c C-p= | Next / previous difference                            |
+| =e=            | =C-c C-e=        | Put the current hunk in Claude's prompt (to ask about it) |
+| =f=            | =C-c C-f=        | Send all your comments to Claude                          |
+| =c=            |                | Move into the comment window                              |
+| =g=            | =C-c C-g=        | Recompute the differences from the file on disk           |
+| =o=            | =C-c C-o=        | Show another changed file                                 |
+| =q=            | =C-c C-q=        | Quit the review                                           |
 
-A hunk without a justification shows a placeholder. That hunk may be your own edit, or one Claude made without annotating. Press =e= on it and ask Claude to explain it; Claude records the justification with =review_annotate= and the pane updates.
+Every other ediff key works in the control window as usual, for example =v= and =V= to scroll both diff windows, =?= for ediff's help, or =a= to copy the baseline text over a change.
 
-The panes rebuild on their own when the file shown changes on disk, after =claude-code-ide-review-sync-delay= seconds. A justification whose hunk changed afterwards is marked stale.
+The comment window holds the comment of the current hunk only and saves it as you type; move with =n= and =p= to comment on another hunk. Comments are kept in memory for the project, so switching files or recomputing does not lose them, but closing Emacs does.
+
+A hunk without a justification shows a placeholder. That hunk may be your own edit, or one Claude made without annotating. Press =e= on it and ask Claude to explain it; Claude records the justification with =review_annotate= and the window updates.
+
+The differences are recomputed on their own when the file shown changes on disk, after =claude-code-ide-review-sync-delay= seconds. A justification whose hunk changed afterwards is marked stale.
 
 *** Finishing
 
@@ -271,7 +278,7 @@ A commit does not move the baseline, so the review of uncommitted work continues
 | =claude-code-ide-review-auto-baseline=            | =t=       | Record a baseline when a project's first session starts              |
 | =claude-code-ide-review-rebaseline-when-committed= | =t=       | Move the baseline to HEAD once everything is committed               |
 | =claude-code-ide-review-max-file-size=            | 1 MiB   | Largest untracked file included in the review                        |
-| =claude-code-ide-review-context-lines=            | =3=       | Unchanged lines shown around each hunk                               |
+| =claude-code-ide-review-comment-lines=            | =6=       | Height of the justification and comment windows                      |
 | =claude-code-ide-review-inline-limit=             | =27000=   | Longest comment text typed into the prompt directly                  |
 | =claude-code-ide-review-sync-delay=               | =0.5=     | Idle seconds before the panes rebuild after a file change; =nil= disables |
 | =claude-code-ide-review-explain-sends-prompt=     | =nil=     | Whether =e= also submits an explain request                            |

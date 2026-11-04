@@ -3874,6 +3874,79 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                                                       (should (eql (claude-code-ide-review-view-hunk view) 0))
                                                                                       (should (equal (claude-code-ide-review--difference-lines view 0) '(1 . 1)))))))
 
+(ert-deftest claude-code-ide-review-test-map-line ()
+  "Lines map between baseline and working file through the hunk table."
+  (let ((hunks (list (make-claude-code-ide-review-hunk
+                      :id "h1" :file "a.txt" :old-start 2 :old-count 1 :new-start 2 :new-count 2
+                      :removed "two" :added "2\n2b")
+                     (make-claude-code-ide-review-hunk
+                      :id "h2" :file "a.txt" :old-start 4 :old-count 0 :new-start 5 :new-count 1
+                      :removed "" :added "four"))))
+    ;; Baseline: one two three (three lines).  Working: one 2 2b three four.
+    ;; Old line 4 is the insertion point git reports: it precedes the
+    ;; inserted line, so it maps by offset to 5
+    (should (equal (mapcar (lambda (line) (claude-code-ide-review--map-line hunks line 'old))
+                           '(1 2 3 4 5))
+                   '(1 2 4 5 7)))
+    (should (equal (mapcar (lambda (line) (claude-code-ide-review--map-line hunks line 'new))
+                           '(1 2 3 4 5 6))
+                   '(1 2 2 3 4 4)))
+    ;; Without hunks the mapping is the identity
+    (should (= (claude-code-ide-review--map-line nil 17 'old) 17))
+    ;; A deletion at the top of the file maps to line 1, never 0
+    (let ((top (list (make-claude-code-ide-review-hunk
+                      :id "h3" :file "a.txt" :old-start 1 :old-count 1 :new-start 0 :new-count 0
+                      :removed "one" :added ""))))
+      (should (= (claude-code-ide-review--map-line top 1 'old) 1))
+      (should (= (claude-code-ide-review--map-line top 2 'old) 1)))))
+
+(ert-deftest claude-code-ide-review-test-scroll-sync-follows-both-ways ()
+  "Scrolling ediff window A moves B to the matching line, and the other way round."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-review-tests--with-repo repo
+                                           (let* ((lines (cl-loop for i from 1 to 60 collect (format "line %02d" i)))
+                                                  (baseline (concat (string-join lines "\n") "\n"))
+                                                  ;; Insert five lines after line 10: working line N+5 = baseline line N for N > 10
+                                                  (working (concat (string-join (append (cl-subseq lines 0 10)
+                                                                                        (cl-loop for i from 1 to 5 collect (format "new %d" i))
+                                                                                        (cl-subseq lines 10))
+                                                                                "\n")
+                                                                   "\n")))
+                                             (claude-code-ide-review-tests--write repo "a.txt" baseline)
+                                             (claude-code-ide-review-tests--git repo "add" "a.txt")
+                                             (claude-code-ide-review-tests--git repo "commit" "-q" "-m" "long")
+                                             (claude-code-ide-review--snapshot repo "sid-1")
+                                             (claude-code-ide-review-tests--write repo "a.txt" working)
+                                             (claude-code-ide-review-tests--with-view repo "a.txt"
+                                                                                      (let* ((view claude-code-ide-review--view)
+                                                                                             (control (claude-code-ide-review-view-control view))
+                                                                                             (window-a (buffer-local-value 'ediff-window-A control))
+                                                                                             (window-b (buffer-local-value 'ediff-window-B control)))
+                                                                                        (should (memq #'claude-code-ide-review--on-scroll window-scroll-functions))
+                                                                                        (cl-flet ((start-line (window)
+                                                                                                    (with-current-buffer (window-buffer window)
+                                                                                                      (line-number-at-pos (window-start window))))
+                                                                                                  (position (window line)
+                                                                                                    (with-current-buffer (window-buffer window)
+                                                                                                      (claude-code-ide-review--line-position line))))
+                                                                                          ;; A shows from baseline line 30: B must show from working line 35
+                                                                                          (claude-code-ide-review--on-scroll window-a (position window-a 30))
+                                                                                          (should (= (start-line window-b) 35))
+                                                                                          ;; B shows from working line 41: A must show from baseline line 36
+                                                                                          (claude-code-ide-review--on-scroll window-b (position window-b 41))
+                                                                                          (should (= (start-line window-a) 36))
+                                                                                          ;; Inside the inserted block B maps to the line before the insertion
+                                                                                          (claude-code-ide-review--on-scroll window-b (position window-b 13))
+                                                                                          (should (= (start-line window-a) 10))
+                                                                                          ;; Another window, or a sync already in progress, moves nothing
+                                                                                          (set-window-start window-b (position window-b 50) t)
+                                                                                          (claude-code-ide-review--on-scroll (selected-window) 1)
+                                                                                          (should (= (start-line window-b) 50))
+                                                                                          (let ((claude-code-ide-review--syncing t))
+                                                                                            (claude-code-ide-review--on-scroll window-a (position window-a 1)))
+                                                                                          (should (= (start-line window-b) 50)))))
+                                             (should-not (memq #'claude-code-ide-review--on-scroll window-scroll-functions)))))
+
 (ert-deftest claude-code-ide-review-test-tool-open-opens-view ()
   "review_open opens the view on the first changed file and says so."
   (skip-unless (executable-find "git"))
