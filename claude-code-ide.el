@@ -1226,12 +1226,61 @@ when navigating between terminal and other buffers."
               (goto-char terminal-point)
               (recenter)))))))))
 
+(defun claude-code-ide--split-command-words (command-string)
+  "Split COMMAND-STRING into the words of one command, as a POSIX shell would.
+Single quotes, double quotes and backslash escapes are honoured and
+removed.  Unlike `split-string-shell-command', the characters ; & and |
+are ordinary text: the string is one command whose arguments were
+produced by `shell-quote-argument', and a system prompt or tool
+description may well contain a semicolon."
+  (let ((words '())
+        (chars '())
+        (in-word nil)
+        (i 0)
+        (n (length command-string)))
+    (cl-flet ((finish-word ()
+                (when in-word
+                  (push (apply #'string (nreverse chars)) words)
+                  (setq chars nil in-word nil))))
+      (while (< i n)
+        (let ((c (aref command-string i)))
+          (cond
+           ((memq c '(?\s ?\t ?\n))
+            (finish-word))
+           ((eq c ?\\)
+            (setq i (1+ i) in-word t)
+            (when (< i n)
+              (push (aref command-string i) chars)))
+           ((eq c ?\')
+            (setq in-word t)
+            (let ((end (or (string-search "'" command-string (1+ i)) n)))
+              (dolist (quoted (string-to-list (substring command-string (1+ i) end)))
+                (push quoted chars))
+              (setq i end)))
+           ((eq c ?\")
+            (setq in-word t i (1+ i))
+            (while (and (< i n) (not (eq (aref command-string i) ?\")))
+              (let ((d (aref command-string i)))
+                (if (and (eq d ?\\) (< (1+ i) n)
+                         (memq (aref command-string (1+ i)) '(?\" ?\\ ?$ ?`)))
+                    (progn (setq i (1+ i))
+                           (push (aref command-string i) chars))
+                  (push d chars)))
+              (setq i (1+ i))))
+           (t
+            (setq in-word t)
+            (push c chars))))
+        (setq i (1+ i)))
+      (finish-word))
+    (nreverse words)))
+
 (defun claude-code-ide--parse-command-string (command-string)
   "Parse a command string into (program . args) for terminal exec APIs.
-COMMAND-STRING is a shell command line to parse.
-Returns a cons cell (program . args) where program is the executable
-and args is a list of arguments."
-  (let ((parts (split-string-shell-command command-string)))
+COMMAND-STRING is one shell command as built by
+`claude-code-ide--build-claude-command'.  Returns a cons cell
+\(program . args) where program is the executable and args is a list
+of arguments with the shell quoting removed."
+  (let ((parts (claude-code-ide--split-command-words command-string)))
     (cons (car parts) (cdr parts))))
 
 (defun claude-code-ide--resolve-program (program)

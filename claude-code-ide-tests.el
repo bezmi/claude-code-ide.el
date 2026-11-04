@@ -1306,6 +1306,44 @@ next toggle, independent of which project the instances belong to."
     (should (string-match "-d.*-c" (claude-code-ide--build-claude-command t)))
     (should (string-match "-d.*-r" (claude-code-ide--build-claude-command nil t)))))
 
+(ert-deftest claude-code-ide-test-parse-command-string-quoting ()
+  "The exec parser removes shell quoting and keeps ; & | as text."
+  (should (equal (claude-code-ide--parse-command-string "claude -d --flag value")
+                 '("claude" "-d" "--flag" "value")))
+  ;; `shell-quote-argument' output: backslash escapes
+  (should (equal (claude-code-ide--parse-command-string
+                  (concat "claude --append-system-prompt "
+                          (shell-quote-argument "Match style; name any behaviour change. Use a | b & c")))
+                 '("claude" "--append-system-prompt"
+                   "Match style; name any behaviour change. Use a | b & c")))
+  ;; Single quotes keep everything literal
+  (should (equal (claude-code-ide--parse-command-string "x 'a; b \\n \"c\"' y")
+                 '("x" "a; b \\n \"c\"" "y")))
+  ;; Double quotes: escaped quotes and backslashes, as the --mcp-config flag uses
+  (should (equal (claude-code-ide--parse-command-string
+                  "claude --mcp-config \"{\\\"a\\\": \\\"b\\\\c\\\"}\" --allowedTools t1 t2")
+                 '("claude" "--mcp-config" "{\"a\": \"b\\c\"}" "--allowedTools" "t1" "t2")))
+  ;; Tabs and repeated spaces separate words; an escaped space does not
+  (should (equal (claude-code-ide--parse-command-string "a  \tb\\ c")
+                 '("a" "b c"))))
+
+(ert-deftest claude-code-ide-test-parse-command-string-with-review-prompt ()
+  "A full command with the review rules paragraph parses to one program and intact arguments."
+  (let ((claude-code-ide-cli-path "claude")
+        (claude-code-ide-system-prompt nil)
+        (claude-code-ide-cli-debug nil)
+        (claude-code-ide-cli-extra-flags "")
+        (claude-code-ide-enable-mcp-server nil)
+        (claude-code-ide-review-annotate-on-edit t)
+        (claude-code-ide-system-prompt-functions (list #'claude-code-ide-review--system-prompt)))
+    (let* ((parsed (claude-code-ide--parse-command-string (claude-code-ide--build-claude-command)))
+           (prompt (nth 1 (cdr parsed))))
+      (should (equal (car parsed) "claude"))
+      (should (equal (nth 0 (cdr parsed)) "--append-system-prompt"))
+      (should (= (length (cdr parsed)) 2))
+      (should (string-match-p "Connected to Emacs" prompt))
+      (should (string-match-p "name any behaviour change\\.$" prompt)))))
+
 (ert-deftest claude-code-ide-test-build-command-with-system-prompt ()
   "Test building command with append-system-prompt flag."
   ;; Test with user system prompt
