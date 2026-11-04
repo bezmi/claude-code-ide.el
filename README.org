@@ -217,7 +217,7 @@ The review view shows every change made to a file since a baseline, together wit
 | bottom right | Your comment on the current hunk                               | yes      |
 | last line    | ediff's control window                                          |          |
 
-The two diff windows show the whole file with ediff's highlighting and scroll together: moving one, with the wheel, =C-v= or anything else, moves the other to the matching line. The bottom windows follow the current difference; their height is =claude-code-ide-review-comment-lines=.
+The two diff windows show the whole file with ediff's highlighting and scroll together: moving one, with the wheel, =C-v= or anything else, moves the other to the matching line and, as with ediff's own commands, moves point in that window into view, including in the file buffer. The bottom windows follow the current difference; their height is =claude-code-ide-review-comment-lines=.
 
 The flow is: enable the feature once, let Claude work, open the review, read each hunk with its justification, type comments where you disagree, and send the comments back to Claude in one prompt.
 

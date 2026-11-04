@@ -1341,25 +1341,40 @@ grows by the hunk's size difference."
 (defun claude-code-ide-review--on-scroll (window start)
   "`window-scroll-functions' member: keep ediff windows A and B aligned.
 START is the position WINDOW is about to show first; inside this hook
-`window-start' still returns the old value, so START must be used."
-  (when-let* ((view claude-code-ide-review--view)
-              ((not claude-code-ide-review--syncing))
-              (control (claude-code-ide-review-view-control view))
-              ((buffer-live-p control)))
-    (let* ((window-a (buffer-local-value 'ediff-window-A control))
-           (window-b (buffer-local-value 'ediff-window-B control))
-           (other (cond ((eq window window-a) window-b)
-                        ((eq window window-b) window-a))))
-      (when (and (window-live-p other) (window-live-p window))
-        (let* ((claude-code-ide-review--syncing t)
-               (line (with-current-buffer (window-buffer window)
-                       (line-number-at-pos start)))
-               (target (claude-code-ide-review--map-line
-                        (claude-code-ide-review-view-hunks view)
-                        line
-                        (if (eq window window-a) 'old 'new))))
-          (with-current-buffer (window-buffer other)
-            (set-window-start other (claude-code-ide-review--line-position target) t)))))))
+`window-start' still returns the old value, so START must be used.
+
+The other window's start is forced, so redisplay keeps it and moves
+that window's point into view when it was off screen.  An optional
+start would be dropped whenever the point was elsewhere, which is the
+case as soon as only one window has been scrolled.  Redisplay then runs
+this hook for the moved window with the start just set; the window
+parameter `claude-code-ide-review-synced-start' marks that start so it
+is not mapped back, which would snap the scrolled window to a hunk
+boundary."
+  (let ((synced (window-parameter window 'claude-code-ide-review-synced-start)))
+    (set-window-parameter window 'claude-code-ide-review-synced-start nil)
+    (when-let* ((view claude-code-ide-review--view)
+                ((not claude-code-ide-review--syncing))
+                ((not (eql synced start)))
+                (control (claude-code-ide-review-view-control view))
+                ((buffer-live-p control)))
+      (let* ((window-a (buffer-local-value 'ediff-window-A control))
+             (window-b (buffer-local-value 'ediff-window-B control))
+             (other (cond ((eq window window-a) window-b)
+                          ((eq window window-b) window-a))))
+        (when (and (window-live-p other) (window-live-p window))
+          (let* ((claude-code-ide-review--syncing t)
+                 (line (with-current-buffer (window-buffer window)
+                         (line-number-at-pos start)))
+                 (target (claude-code-ide-review--map-line
+                          (claude-code-ide-review-view-hunks view)
+                          line
+                          (if (eq window window-a) 'old 'new)))
+                 (position (with-current-buffer (window-buffer other)
+                             (claude-code-ide-review--line-position target))))
+            (unless (= position (window-start other))
+              (set-window-parameter other 'claude-code-ide-review-synced-start position)
+              (set-window-start other position))))))))
 
 ;;; View: navigation
 

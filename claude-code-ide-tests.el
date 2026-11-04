@@ -3936,6 +3936,16 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                                                           (claude-code-ide-review--on-scroll window-b (position window-b 41))
                                                                                           (should (= (start-line window-a) 36))
                                                                                           ;; Inside the inserted block B maps to the line before the insertion
+                                                                                          (set-window-start window-b (position window-b 13))
+                                                                                          (claude-code-ide-review--on-scroll window-b (position window-b 13))
+                                                                                          (should (= (start-line window-a) 10))
+                                                                                          ;; Redisplay reports the start just set for A: it must not map back
+                                                                                          ;; and snap B to line 10; a later scroll of A to the same place does
+                                                                                          (claude-code-ide-review--on-scroll window-a (position window-a 10))
+                                                                                          (should (= (start-line window-b) 13))
+                                                                                          (claude-code-ide-review--on-scroll window-a (position window-a 10))
+                                                                                          (should (= (start-line window-b) 10))
+                                                                                          ;; Scrolling again from B restores the mapping
                                                                                           (claude-code-ide-review--on-scroll window-b (position window-b 13))
                                                                                           (should (= (start-line window-a) 10))
                                                                                           ;; Another window, or a sync already in progress, moves nothing
