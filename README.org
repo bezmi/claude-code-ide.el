@@ -131,7 +131,12 @@ The easiest way to interact with Claude Code IDE is through the transient menu i
 | Command                                 | Description                                       |
 |-----------------------------------------+---------------------------------------------------|
 | =M-x claude-code-ide-menu=                | Open transient menu with all Claude Code commands |
+| =M-x claude-code-ide-review-menu=         | Open the review submenu                           |
 | =M-x claude-code-ide-emacs-tools-setup=   | Set up built-in MCP tools (e.g. xref, project)    |
+| =M-x claude-code-ide-review-setup=        | Set up the review tools and slash command         |
+| =M-x claude-code-ide-review-open=         | Review Claude's edits in four panes (=C-u=: file) |
+| =M-x claude-code-ide-review-finish=       | Send your review comments to Claude               |
+| =M-x claude-code-ide-review-mark-baseline= | Start a fresh review from the current files      |
 | =M-x claude-code-ide=                     | Start a new Claude Code instance for the project  |
 | =M-x claude-code-ide-send-prompt=         | Send prompt to Claude from minibuffer input       |
 | =M-x claude-code-ide-continue=            | Continue most recent conversation in new instance |
@@ -199,6 +204,92 @@ When =claude-code-ide-use-ide-diff= is enabled (default), Claude's code suggesti
 7. If you accept (=y=), any changes from Buffer B will be sent back to Claude to be applied on the original file
 
 This allows you to refine Claude's suggestions before they're applied, ensuring the final code meets your exact requirements.
+
+** Reviewing Claude's Edits
+
+The review view shows every change made to a file since a baseline, together with Claude's reason for each change and your comments on it, in four panes that scroll together:
+
+| Pane         | Content                                                | Editable               |
+|--------------+--------------------------------------------------------+------------------------|
+| top left     | The file as it was at the baseline                     | no                     |
+| top right    | The file as it is on disk now                          | no                     |
+| bottom left  | Claude's justification for each change (hunk)          | no                     |
+| bottom right | Your comment on each hunk                              | the current hunk only  |
+
+The flow is: enable the feature once, let Claude work, open the review, read each hunk with its justification, type comments where you disagree, and send the comments back to Claude in one prompt.
+
+*** Setup
+
+#+begin_src emacs-lisp
+(claude-code-ide-review-setup)
+#+end_src
+
+This registers five MCP tools (listed below), the =/emacs-tools:review (MCP)= slash command, and a hook that records a baseline of the working tree when the first Claude session of a project starts. The baseline is a hidden git commit under =refs/claude-review/=; it is removed when Emacs exits and is never part of your branch. Files ignored by git and untracked files above =claude-code-ide-review-max-file-size= are left out.
+
+*** Opening the view
+
+Ask Claude to open the review, type =/emacs-tools:review=, or run =M-x claude-code-ide-review-open= (=C-u= picks the file). The view takes a new tab when =tab-bar-mode= is on, otherwise it replaces the current window layout until you quit.
+
+| Panes 0 to 2 | Comment pane | Action                                              |
+|--------------+--------------+-----------------------------------------------------|
+| =n=            | =C-c C-n=      | Next hunk                                           |
+| =p=            | =C-c C-p=      | Previous hunk                                       |
+| =e=            | =C-c C-e=      | Put the current hunk in Claude's prompt (to ask about it) |
+| =f=            | =C-c C-f=      | Send all your comments to Claude                    |
+| =g=            | =C-c C-g=      | Rebuild the panes from disk                         |
+| =o=            | =C-c C-o=      | Show another changed file                           |
+| =q=            | =C-c C-q=      | Quit the review                                     |
+
+The comment pane accepts text only in the current hunk's block; move with =n= and =p= to comment on another hunk. Comments are kept in memory for the project, so switching files or rebuilding does not lose them, but closing Emacs does.
+
+A hunk without a justification shows a placeholder. That hunk may be your own edit, or one Claude made without annotating. Press =e= on it and ask Claude to explain it; Claude records the justification with =review_annotate= and the pane updates.
+
+The panes rebuild on their own when the file shown changes on disk, after =claude-code-ide-review-sync-delay= seconds. A justification whose hunk changed afterwards is marked stale.
+
+*** Finishing
+
+=f= sends every comment, each with its file, line range and diff, to the Claude prompt. Above =claude-code-ide-review-inline-limit= characters it sends a short prompt instead and Claude reads the comments through =review_get_comments=.
+
+A commit does not move the baseline, so the review of uncommitted work continues. Once everything is committed and no comment is unsent, the baseline moves to the new HEAD and the review starts empty. To start over by hand, run =M-x claude-code-ide-review-mark-baseline=; this discards all justifications and comments.
+
+*** Tools and slash command
+
+| Tool                   | Arguments                                         | What it does                                                       |
+|------------------------+---------------------------------------------------+--------------------------------------------------------------------|
+| =review_mark_baseline=   | none                                              | Snapshot the working tree now; refuses while you have unsent comments |
+| =review_list_hunks=      | =file_path= (optional)                              | List hunks with their status: =ok=, =unexplained= or =stale=             |
+| =review_annotate=        | =file_path=, =start_line=, =end_line=, =justification=  | Record the justification for the hunk at those lines               |
+| =review_open=            | =file_path= (optional)                              | Open the view on a file                                            |
+| =review_get_comments=    | none                                              | Return your comments with their hunks                              |
+
+=/emacs-tools:review= takes an optional =rules= argument. It tells Claude to open the view, list the hunks and annotate the ones it made in this conversation, following the given rules or =claude-code-ide-review-rules=. Hunks Claude did not make are left alone.
+
+*** Options
+
+| Option                                          | Default | Meaning                                                              |
+|-------------------------------------------------+---------+----------------------------------------------------------------------|
+| =claude-code-ide-review-auto-baseline=            | =t=       | Record a baseline when a project's first session starts              |
+| =claude-code-ide-review-rebaseline-when-committed= | =t=       | Move the baseline to HEAD once everything is committed               |
+| =claude-code-ide-review-max-file-size=            | 1 MiB   | Largest untracked file included in the review                        |
+| =claude-code-ide-review-context-lines=            | =3=       | Unchanged lines shown around each hunk                               |
+| =claude-code-ide-review-inline-limit=             | =27000=   | Longest comment text typed into the prompt directly                  |
+| =claude-code-ide-review-sync-delay=               | =0.5=     | Idle seconds before the panes rebuild after a file change; =nil= disables |
+| =claude-code-ide-review-explain-sends-prompt=     | =nil=     | Whether =e= also submits an explain request                            |
+| =claude-code-ide-review-rules=                    | see docstring | Rules Claude follows when writing justifications               |
+| =claude-code-ide-review-annotate-on-edit=         | =nil=     | Ask Claude in its system prompt to annotate after every edit         |
+| =claude-code-ide-review-remind-on-edit=           | =nil=     | Remind Claude of unexplained hunks after each edit (needs =M-x server-start=) |
+
+=claude-code-ide-review-rules= and =claude-code-ide-review-annotate-on-edit= are also reachable from =M-x claude-code-ide-review-menu=.
+
+*** Reminders after each edit
+
+The system prompt paragraph asks Claude to annotate; over a long session it may forget. With =claude-code-ide-review-remind-on-edit= set and an Emacs server running (=M-x server-start=), new sessions get a Claude Code PostToolUse hook on the Edit, Write and MultiEdit tools. After each edit the hook asks Emacs, through =emacsclient=, which hunks of that file still lack a justification, and Claude sees the answer next to its tool result, for example:
+
+#+begin_example
+Review: 2 hunks in src/main.c have no justification: src/main.c:12-14, src/main.c:40-40 (stale). Call review_annotate for the ones you made.
+#+end_example
+
+The hook lists hunks only; Claude decides which of them it made. Without a running server the option does nothing and =claude-code-ide-review-setup= says so.
 
 ** Configuration
 

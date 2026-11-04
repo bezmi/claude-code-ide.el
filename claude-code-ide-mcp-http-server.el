@@ -39,6 +39,12 @@
 
 (defvar claude-code-ide-mcp-server--current-session-id)
 
+(define-error 'json-rpc-error "JSON-RPC error" 'error)
+;; Signalled as (json-rpc-error CODE MESSAGE).  `handle-post' turns it
+;; into a JSON-RPC error response carrying CODE and MESSAGE.  Without
+;; this declaration Emacs reports "Invalid error symbol" and the client
+;; receives -32603 instead of the code the handler chose.
+
 ;; Require web-server at runtime to avoid batch mode issues
 (unless (featurep 'web-server)
   (condition-case err
@@ -165,6 +171,11 @@ with the appropriate session context."
      (claude-code-ide-mcp-http-server--send-json-error
       request nil -32700 "Parse error"))
 
+    (json-rpc-error
+     ;; err is (json-rpc-error CODE MESSAGE); forward both unchanged
+     (claude-code-ide-mcp-http-server--send-json-error
+      request nil (nth 1 err) (nth 2 err)))
+
     (quit
      (claude-code-ide-debug "Request cancelled by user (C-<escape>)")
      (claude-code-ide-mcp-http-server--send-json-error
@@ -189,6 +200,10 @@ PARAMS is the parameters alist."
      (claude-code-ide-mcp-http-server--handle-tools-list params))
     ("tools/call"
      (claude-code-ide-mcp-http-server--handle-tools-call params))
+    ("prompts/list"
+     (claude-code-ide-mcp-http-server--handle-prompts-list params))
+    ("prompts/get"
+     (claude-code-ide-mcp-http-server--handle-prompts-get params))
     (_
      (signal 'json-rpc-error (list -32601 "Method not found")))))
 
@@ -196,9 +211,60 @@ PARAMS is the parameters alist."
   "Handle the initialize method."
   `((protocolVersion . "2024-11-05")
     (capabilities . ((tools . ((listChanged . :json-false)))
+                     (prompts . ((listChanged . :json-false)))
                      (logging . ,(make-hash-table :test 'equal))))
     (serverInfo . ((name . "claude-code-ide-mcp-tools")
                    (version . "0.1.0")))))
+
+(defun claude-code-ide-mcp-http-server--handle-prompts-list (_params)
+  "Handle the prompts/list method.
+Returns every prompt registered with `claude-code-ide-make-prompt' in
+the MCP 2024-11-05 shape.  `arguments' is always a JSON array, so an
+argument-free prompt encodes as [] rather than null."
+  (let ((prompts
+         (mapcar
+          (lambda (spec)
+            `((name . ,(plist-get spec :name))
+              (description . ,(plist-get spec :description))
+              (arguments
+               . ,(vconcat
+                   (mapcar (lambda (arg)
+                             `((name . ,(plist-get arg :name))
+                               (description . ,(plist-get arg :description))
+                               (required . ,(if (plist-get arg :optional)
+                                                :json-false
+                                              t))))
+                           (plist-get spec :args))))))
+          claude-code-ide-mcp-server-prompts)))
+    (claude-code-ide-debug "MCP server returning %d prompts" (length prompts))
+    `((prompts . ,(vconcat prompts)))))
+
+(defun claude-code-ide-mcp-http-server--handle-prompts-get (params)
+  "Handle the prompts/get method with PARAMS.
+PARAMS holds `name' and an optional `arguments' alist keyed by symbol,
+as produced by `json-parse-string' with `:object-type' alist.  The
+prompt's function receives one value per declared argument, in
+declaration order, nil for an omitted optional argument.  Its string
+result becomes the single user message of the response."
+  (let* ((prompt-name (alist-get 'name params))
+         (arguments (alist-get 'arguments params))
+         (spec (cl-find-if (lambda (s) (string= (plist-get s :name) prompt-name))
+                           claude-code-ide-mcp-server-prompts)))
+    (unless spec
+      (signal 'json-rpc-error (list -32602 (format "Unknown prompt: %s" prompt-name))))
+    (let ((values
+           (mapcar (lambda (arg)
+                     (let* ((name (plist-get arg :name))
+                            (value (alist-get (intern name) arguments)))
+                       (when (and (not value) (not (plist-get arg :optional)))
+                         (signal 'json-rpc-error
+                                 (list -32602 (format "Missing required argument: %s" name))))
+                       value))
+                   (plist-get spec :args))))
+      `((description . ,(plist-get spec :description))
+        (messages . [((role . "user")
+                      (content . ((type . "text")
+                                  (text . ,(apply (plist-get spec :function) values)))))])))))
 
 (defun claude-code-ide-mcp-http-server--handle-tools-list (_params)
   "Handle the tools/list method."

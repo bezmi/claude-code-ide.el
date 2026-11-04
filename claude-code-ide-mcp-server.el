@@ -151,6 +151,52 @@ Returns the tool specification for convenience."
       ;; Return the spec for convenience
       spec)))
 
+;;; Prompt Definition Functions
+
+(defvar claude-code-ide-mcp-server-prompts nil
+  "List of prompt specs exposed by the MCP tools server.
+Each entry is a plist built by `claude-code-ide-make-prompt'.  Claude
+Code lists each prompt as a slash command named
+/emacs-tools:NAME (MCP), where emacs-tools is the server key from
+`claude-code-ide-mcp-server-get-config'.")
+
+(defun claude-code-ide-make-prompt (&rest slots)
+  "Register an MCP prompt for the tools server and return its spec.
+
+The following keyword arguments are available:
+
+NAME: The prompt name (string).  It becomes the slash command suffix.
+
+DESCRIPTION: What the prompt does, shown in the slash command menu.
+
+FUNCTION: A function that receives one value per entry in ARGS, in
+ARGS order, and returns the prompt text as a string.  An omitted
+optional argument arrives as nil.
+
+ARGS: A list of plists describing the arguments, or nil.  Each plist
+has :name (string), :description (string) and optionally :optional
+(boolean, default nil).  MCP prompt arguments are always strings, so
+there is no :type key.
+
+The spec is added to `claude-code-ide-mcp-server-prompts'."
+  (let ((function (plist-get slots :function))
+        (name (plist-get slots :name))
+        (description (plist-get slots :description))
+        (args (plist-get slots :args)))
+    (unless function
+      (error "Prompt :function is required"))
+    (unless name
+      (error "Prompt :name is required"))
+    (unless description
+      (error "Prompt :description is required"))
+    (let ((spec (list :function function
+                      :name name
+                      :description description)))
+      (when args
+        (setq spec (plist-put spec :args args)))
+      (add-to-list 'claude-code-ide-mcp-server-prompts spec)
+      spec)))
+
 ;;; Format Detection and Conversion
 
 (defun claude-code-ide--tool-format-p (tool-spec)
@@ -244,23 +290,41 @@ Returns nil if server is not running."
              (claude-code-ide-mcp-server--server-alive-p))
     claude-code-ide-mcp-server--port))
 
+(defvar claude-code-ide-mcp-server-session-started-hook nil
+  "Functions called after a Claude session registers with the tools server.
+Each function receives SESSION-ID and PROJECT-DIR.  Modules that keep
+per-session or per-project state, such as the review baseline, attach
+here so `claude-code-ide' itself need not depend on them.")
+
+(defvar claude-code-ide-mcp-server-session-ended-hook nil
+  "Functions called with SESSION-ID before a Claude session is unregistered.
+The session is still in `claude-code-ide-mcp-server--sessions' while
+the hook runs, so a function can read its project directory.")
+
 (defun claude-code-ide-mcp-server-session-started (&optional session-id project-dir buffer)
   "Notify that a Claude session has started.
-If SESSION-ID and PROJECT-DIR are provided, register the session.
+If SESSION-ID and PROJECT-DIR are provided, register the session and
+run `claude-code-ide-mcp-server-session-started-hook'.
 BUFFER may be nil when the terminal has not been created yet; use
 `claude-code-ide-mcp-server-update-session-buffer' once it exists.
 The server lifecycle follows the registered-session table, so an
 unbalanced end call cannot stop the server under a live session."
   (when (and session-id project-dir)
-    (claude-code-ide-mcp-server-register-session session-id project-dir buffer))
+    (claude-code-ide-mcp-server-register-session session-id project-dir buffer)
+    (run-hook-with-args 'claude-code-ide-mcp-server-session-started-hook
+                        session-id project-dir))
   (claude-code-ide-debug "MCP session started. Count: %d"
                          (hash-table-count claude-code-ide-mcp-server--sessions)))
 
 (defun claude-code-ide-mcp-server-session-ended (&optional session-id)
   "Notify that the Claude session SESSION-ID has ended.
-Unregisters the session and stops the server when none remain.
-Idempotent: ending an unknown or already-ended session is a no-op."
+Runs `claude-code-ide-mcp-server-session-ended-hook' for a registered
+session, then unregisters it and stops the server when none remain.
+Idempotent: ending an unknown or already-ended session is a no-op and
+does not run the hook."
   (when session-id
+    (when (gethash session-id claude-code-ide-mcp-server--sessions)
+      (run-hook-with-args 'claude-code-ide-mcp-server-session-ended-hook session-id))
     (claude-code-ide-mcp-server-unregister-session session-id))
   (claude-code-ide-debug "MCP session ended. Count: %d"
                          (hash-table-count claude-code-ide-mcp-server--sessions))

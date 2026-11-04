@@ -141,6 +141,19 @@ Set to nil to disable (default)."
                  (string :tag "System prompt text"))
   :group 'claude-code-ide)
 
+(defvar claude-code-ide-system-prompt-functions nil
+  "Functions that add paragraphs to the system prompt of a new session.
+Each is called with no arguments when the Claude command line is built
+and returns a string, appended after `claude-code-ide-system-prompt',
+or nil to add nothing.  Features that need Claude to know about them
+add to this hook instead of changing the user's option.")
+
+(defvar claude-code-ide-command-flag-functions nil
+  "Functions that add command-line flags to a new session's command.
+Each is called with no arguments when the command line is built and
+returns a string of flags, already shell-quoted, or nil to add nothing.
+The result follows `claude-code-ide-cli-extra-flags'.")
+
 (defcustom claude-code-ide-mcp-allowed-tools 'auto
   "Configuration for allowed MCP tools when MCP server is enabled.
 Can be one of:
@@ -1146,6 +1159,10 @@ Additional flags from `claude-code-ide-cli-extra-flags' are also included."
       ;; Append user's custom prompt if set
       (when claude-code-ide-system-prompt
         (setq combined-prompt (concat combined-prompt "\n\n" claude-code-ide-system-prompt)))
+      ;; Paragraphs contributed by features
+      (dolist (function claude-code-ide-system-prompt-functions)
+        (when-let* ((paragraph (funcall function)))
+          (setq combined-prompt (concat combined-prompt "\n\n" paragraph))))
       ;; Add the combined prompt to the command
       (setq claude-cmd (concat claude-cmd " --append-system-prompt "
                                (shell-quote-argument combined-prompt))))
@@ -1153,6 +1170,10 @@ Additional flags from `claude-code-ide-cli-extra-flags' are also included."
     (when (and claude-code-ide-cli-extra-flags
                (not (string-empty-p claude-code-ide-cli-extra-flags)))
       (setq claude-cmd (concat claude-cmd " " claude-code-ide-cli-extra-flags)))
+    ;; Flags contributed by features
+    (dolist (function claude-code-ide-command-flag-functions)
+      (when-let* ((flags (funcall function)))
+        (setq claude-cmd (concat claude-cmd " " flags))))
     ;; Add MCP tools config if enabled
     (when (claude-code-ide-mcp-server-ensure-server)
       (when-let* ((config (claude-code-ide-mcp-server-get-config session-id)))

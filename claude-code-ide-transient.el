@@ -43,6 +43,16 @@
 (declare-function claude-code-ide-insert-at-mentioned "claude-code-ide" ())
 (declare-function claude-code-ide-clear-selection "claude-code-ide" ())
 (declare-function claude-code-ide-send-prompt "claude-code-ide" (&optional prompt session))
+
+;; The review module is loaded on demand by its autoloaded commands;
+;; only its options are referenced here
+(declare-function claude-code-ide-review-open "claude-code-ide-review" (&optional file))
+(declare-function claude-code-ide-review-finish "claude-code-ide-review" ())
+(declare-function claude-code-ide-review-quit "claude-code-ide-review" ())
+(declare-function claude-code-ide-review-mark-baseline "claude-code-ide-review" (&optional project-dir))
+(declare-function claude-code-ide-review-setup "claude-code-ide-review" ())
+(defvar claude-code-ide-review-annotate-on-edit)
+(defvar claude-code-ide-review-rules)
 (declare-function claude-code-ide-send-escape "claude-code-ide" ())
 (declare-function claude-code-ide-insert-newline "claude-code-ide" ())
 (declare-function claude-code-ide-toggle "claude-code-ide" (&optional pick))
@@ -306,6 +316,23 @@
   (setq claude-code-ide-cli-debug (not claude-code-ide-cli-debug))
   (claude-code-ide-log "CLI debug mode %s" (if claude-code-ide-cli-debug "enabled" "disabled")))
 
+(transient-define-suffix claude-code-ide--toggle-review-annotate-on-edit ()
+  "Toggle asking Claude to justify every edit in its system prompt."
+  (interactive)
+  (require 'claude-code-ide-review)
+  (setq claude-code-ide-review-annotate-on-edit (not claude-code-ide-review-annotate-on-edit))
+  (claude-code-ide-log "Annotate on edit %s; applies to the next session"
+                       (if claude-code-ide-review-annotate-on-edit "enabled" "disabled")))
+
+(transient-define-suffix claude-code-ide--set-review-rules (rules)
+  "Set the justification RULES Claude follows in reviews."
+  (interactive
+   (progn
+     (require 'claude-code-ide-review)
+     (list (read-string "Justification rules: " claude-code-ide-review-rules))))
+  (setq claude-code-ide-review-rules rules)
+  (claude-code-ide-log "Justification rules set"))
+
 (defun claude-code-ide--save-config ()
   "Save current configuration to custom file."
   (interactive)
@@ -322,6 +349,9 @@
   (customize-save-variable 'claude-code-ide-cli-extra-flags claude-code-ide-cli-extra-flags)
   (customize-save-variable 'claude-code-ide-system-prompt claude-code-ide-system-prompt)
   (customize-save-variable 'claude-code-ide-share-opened-file claude-code-ide-share-opened-file)
+  (when (featurep 'claude-code-ide-review)
+    (customize-save-variable 'claude-code-ide-review-annotate-on-edit claude-code-ide-review-annotate-on-edit)
+    (customize-save-variable 'claude-code-ide-review-rules claude-code-ide-review-rules))
   (claude-code-ide-log "Configuration saved to custom file"))
 
 ;;; Transient Menus
@@ -351,8 +381,27 @@
     ("e" "Send escape key" claude-code-ide-send-escape)
     ("n" "Insert newline" claude-code-ide-insert-newline)]
    ["Submenus"
+    ("v" "Review edits" claude-code-ide-review-menu)
     ("C" "Configuration" claude-code-ide-config-menu)
     ("d" "Debugging" claude-code-ide-debug-menu)]])
+
+;;;###autoload (autoload 'claude-code-ide-review-menu "claude-code-ide-transient" "Claude Code review menu." t)
+(transient-define-prefix claude-code-ide-review-menu ()
+  "Review the edits made since the baseline in the four-pane view."
+  ["Claude Code Review"
+   ["View"
+    ("o" "Open review (C-u: pick file)" claude-code-ide-review-open)
+    ("f" "Send comments to Claude" claude-code-ide-review-finish)
+    ("q" "Quit review" claude-code-ide-review-quit)]
+   ["Baseline"
+    ("b" "Mark baseline now" claude-code-ide-review-mark-baseline)
+    ("s" "Enable review tools and slash command" claude-code-ide-review-setup)]
+   ["Options"
+    ("a" claude-code-ide--toggle-review-annotate-on-edit
+     :description (lambda ()
+                    (format "Annotate on edit: %s"
+                            (if (bound-and-true-p claude-code-ide-review-annotate-on-edit) "on" "off"))))
+    ("r" "Set justification rules" claude-code-ide--set-review-rules)]])
 
 (transient-define-prefix claude-code-ide-config-menu ()
   "Claude Code configuration menu."

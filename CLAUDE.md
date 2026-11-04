@@ -19,6 +19,7 @@ This package integrates Claude Code CLI with Emacs via WebSocket and the Model C
 - `claude-code-ide-emacs-tools.el` - Emacs tools: xref, project info, imenu
 - `claude-code-ide-diagnostics.el` - Flycheck integration
 - `claude-code-ide-transient.el` - Transient menu interface
+- `claude-code-ide-review.el` - Four-pane review of edits since a baseline: git snapshot, hunk notes, MCP tools and the `review` prompt
 - `claude-code-ide-debug.el` - Debug logging utilities
 - `claude-code-ide-tests.el` - ERT test suite with mocks
 
@@ -70,6 +71,8 @@ If files fail to load due to syntax errors (missing parentheses, quotes, etc.), 
 ## Testing
 
 **Always write tests for any new logic** - Every new function or significant change should have corresponding tests.
+
+The review tests create temporary git repositories and need `git` on PATH; they skip when it is missing.
 
 Tests use mocks for external dependencies (vterm, websocket) to run in batch mode without requiring actual installations. The test suite covers:
 - Core functionality (session management, CLI detection)
