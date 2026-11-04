@@ -62,6 +62,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'ediff)
 (require 'filenotify)
 (require 'json)
 (require 'project)
@@ -828,49 +829,22 @@ hunks are computed once."
                 (list hunk (car status) (cdr status))))
             hunks)))
 
-;;; Pane contents
+;;; File contents
 
-(defcustom claude-code-ide-review-context-lines 3
-  "Unchanged lines shown on each side of a hunk in the diff panes.
-A longer unchanged span is folded to this many lines next to each
-neighbouring hunk with a marker row in between.  nil shows every line."
-  :type '(choice (const :tag "Show every line" nil)
-                 (integer :tag "Lines"))
-  :group 'claude-code-ide-review)
-
-(defface claude-code-ide-review-removed
-  '((t :inherit diff-removed))
-  "Face for lines removed since the baseline (pane 0)."
-  :group 'claude-code-ide-review)
-
-(defface claude-code-ide-review-added
-  '((t :inherit diff-added))
-  "Face for lines added since the baseline (pane 1)."
-  :group 'claude-code-ide-review)
-
-(defface claude-code-ide-review-padding
-  '((t :inherit shadow))
-  "Face for padding rows that keep the four panes aligned."
-  :group 'claude-code-ide-review)
-
-(defface claude-code-ide-review-fold
-  '((t :inherit shadow :slant italic))
-  "Face for the marker row standing in for folded unchanged lines."
+(defcustom claude-code-ide-review-comment-lines 6
+  "Height, in lines, of the justification and comment windows below the diff.
+The two diff windows take the rest of the frame."
+  :type 'integer
   :group 'claude-code-ide-review)
 
 (defface claude-code-ide-review-header
   '((t :inherit bold))
-  "Face for the header row of a hunk block in the comment panes."
+  "Face for the hunk header line of the justification and comment windows."
   :group 'claude-code-ide-review)
 
 (defface claude-code-ide-review-placeholder
   '((t :inherit font-lock-comment-face))
   "Face for the placeholder shown when Claude left no justification."
-  :group 'claude-code-ide-review)
-
-(defface claude-code-ide-review-line-number
-  '((t :inherit line-number))
-  "Face for the original line number shown before diff rows."
   :group 'claude-code-ide-review)
 
 (defun claude-code-ide-review--read-file (path)
@@ -901,298 +875,35 @@ agrees with the hunks git computed from disk."
        (expand-file-name file (claude-code-ide-review-baseline-toplevel baseline)))
     ""))
 
-(defun claude-code-ide-review--text-lines (text)
-  "Split TEXT into lines without a phantom empty line after a final newline."
-  (if (string-empty-p text)
-      nil
-    (let ((lines (split-string text "\n")))
-      (if (string-empty-p (car (last lines)))
-          (butlast lines)
-        lines))))
-
-;;; Row model
-
-(cl-defstruct claude-code-ide-review-row
-  "One screen line of a review pane, before it is written to a buffer."
-  text  ; the line, without newline
-  kind  ; context, removed, added, padding, fold, header, note or placeholder
-  hunk  ; 0-based index of the hunk the row belongs to, nil in an unchanged span
-  line) ; original line number in the baseline (pane 0) or working file (pane 1)
-
-(defun claude-code-ide-review--padding-rows (count hunk)
-  "Return COUNT padding rows belonging to HUNK (an index or nil)."
-  (let ((rows '()))
-    (dotimes (_ count)
-      (push (make-claude-code-ide-review-row :text "" :kind 'padding :hunk hunk) rows))
-    rows))
-
-(defun claude-code-ide-review--context-rows (lines first-line hunk-before hunk-after)
-  "Return rows for the unchanged LINES, numbered from FIRST-LINE.
-HUNK-BEFORE and HUNK-AFTER say whether a hunk borders the span on that
-side; `claude-code-ide-review-context-lines' lines are kept next to each
-bordering hunk and the rest is replaced by one fold row."
-  (let* ((n claude-code-ide-review-context-lines)
-         (total (length lines))
-         (keep-head (if hunk-before (or n total) (and n 0)))
-         (keep-tail (if hunk-after (or n total) (and n 0)))
-         (row (lambda (text index)
-                (make-claude-code-ide-review-row
-                 :text text :kind 'context :line (+ first-line index)))))
-    (if (or (null n)
-            (<= total (+ (or keep-head 0) (or keep-tail 0) 1)))
-        (cl-loop for text in lines
-                 for index from 0
-                 collect (funcall row text index))
-      (let ((head (seq-take lines keep-head))
-            (tail (last lines keep-tail))
-            (folded (- total keep-head keep-tail)))
-        (append
-         (cl-loop for text in head for index from 0 collect (funcall row text index))
-         (list (make-claude-code-ide-review-row
-                :text (format "⋯ %d unchanged line%s ⋯" folded (if (= folded 1) "" "s"))
-                :kind 'fold))
-         (cl-loop for text in tail
-                  for index from (- total keep-tail)
-                  collect (funcall row text index)))))))
-
-(defun claude-code-ide-review--placeholder-rows (hunk-index)
-  "Return the rows telling the user that hunk HUNK-INDEX has no justification.
+(defun claude-code-ide-review--placeholder-text ()
+  "Return the text shown when the current hunk has no justification.
 The key name follows the current binding of
 `claude-code-ide-review-explain-hunk'."
-  (let ((text (substitute-command-keys
-               "Claude did not leave a comment. This change may have been made by you. If Claude made it, press \\[claude-code-ide-review-explain-hunk] here to send this hunk to the Claude prompt, then ask it to explain the change.")))
-    (mapcar (lambda (line)
-              (make-claude-code-ide-review-row :text line :kind 'placeholder :hunk hunk-index))
-            (with-temp-buffer
-              (insert text)
-              (let ((fill-column 60))
-                (fill-region (point-min) (point-max)))
-              (claude-code-ide-review--text-lines (buffer-string))))))
+  (substitute-command-keys
+   "Claude did not leave a comment. This change may have been made by you. If Claude made it, press \\[claude-code-ide-review-explain-hunk] in the diff to send this hunk to the Claude prompt, then ask it to explain the change."))
 
-(defun claude-code-ide-review--note-rows (hunk-index text kind)
-  "Return rows of KIND for the note TEXT of hunk HUNK-INDEX; one empty row for nil."
-  (mapcar (lambda (line)
-            (make-claude-code-ide-review-row :text line :kind kind :hunk hunk-index))
-          (or (and text (claude-code-ide-review--text-lines text)) (list ""))))
-
-(defun claude-code-ide-review--block-rows (hunk-index hunk status note kind)
-  "Return the comment-pane rows for HUNK: a header, then the note or placeholder.
-STATUS and NOTE come from `claude-code-ide-review-hunk-status' for KIND,
-`claude' for pane 2 or `user' for pane 3."
-  (cons (make-claude-code-ide-review-row
-         :text (format "#%d %s%s"
-                       (1+ hunk-index)
-                       (claude-code-ide-review--hunk-range-string hunk)
-                       (if (eq status 'stale) " (stale)" ""))
-         :kind 'header :hunk hunk-index)
-        (cond
-         ((and (eq kind 'claude) (eq status 'unexplained))
-          (claude-code-ide-review--placeholder-rows hunk-index))
-         (t
-          (claude-code-ide-review--note-rows
-           hunk-index (and note (claude-code-ide-review-note-text note)) 'note)))))
-
-(defun claude-code-ide-review--diff-rows (text kind first-line hunk-index)
-  "Return rows of KIND for the lines of TEXT, numbered from FIRST-LINE."
-  (cl-loop for line in (claude-code-ide-review--text-lines text)
-           for index from 0
-           collect (make-claude-code-ide-review-row
-                    :text line :kind kind :hunk hunk-index :line (+ first-line index))))
-
-(defun claude-code-ide-review--pad-segment (panes hunk-index)
-  "Pad the four row lists in PANES to the same length and return them.
-Padding rows belong to HUNK-INDEX so navigation can find the block."
-  (let ((budget (apply #'max (mapcar #'length panes))))
-    (mapcar (lambda (rows)
-              (append rows (claude-code-ide-review--padding-rows (- budget (length rows)) hunk-index)))
-            panes)))
-
-(defun claude-code-ide-review--span-length (hunk old-pos)
-  "Unchanged lines between OLD-POS and HUNK in the baseline file.
-For a pure insertion git reports the line the text was inserted after,
-so that line is part of the span."
-  (let ((start (claude-code-ide-review-hunk-old-start hunk)))
-    (if (= (claude-code-ide-review-hunk-old-count hunk) 0)
-        (1+ (- start old-pos))
-      (- start old-pos))))
-
-(defun claude-code-ide-review--build-rows (project-dir file)
-  "Return a vector of four equal-length row lists for FILE, one per pane.
-Pane 0 shows the baseline text, pane 1 the working text, pane 2 Claude's
-justifications and pane 3 the user's comments.  Hunk N occupies the same
-line range in all four lists."
-  (let* ((old-lines (claude-code-ide-review--text-lines
-                     (claude-code-ide-review-baseline-content project-dir file)))
-         (hunks (claude-code-ide-review-hunks project-dir file))
-         (panes (list '() '() '() '()))
-         (old-pos 1)
-         (new-pos 1)
-         (append-segment
-          (lambda (segment)
-            (setq panes (cl-mapcar #'append panes segment)))))
-    (cl-loop
-     for hunk in hunks
-     for index from 0
-     do (let* ((span (claude-code-ide-review--span-length hunk old-pos))
-               (lines (seq-subseq old-lines (1- old-pos) (+ (1- old-pos) span)))
-               (claude-status (claude-code-ide-review-hunk-status project-dir hunk 'claude hunks))
-               (user-status (claude-code-ide-review-hunk-status project-dir hunk 'user hunks)))
-          ;; Unchanged span before the hunk
-          (funcall append-segment
-                   (claude-code-ide-review--pad-segment
-                    (list (claude-code-ide-review--context-rows lines old-pos (> index 0) t)
-                          (claude-code-ide-review--context-rows lines new-pos (> index 0) t)
-                          '() '())
-                    nil))
-          ;; The hunk
-          (funcall append-segment
-                   (claude-code-ide-review--pad-segment
-                    (list (claude-code-ide-review--diff-rows
-                           (claude-code-ide-review-hunk-removed hunk) 'removed
-                           (claude-code-ide-review-hunk-old-start hunk) index)
-                          (claude-code-ide-review--diff-rows
-                           (claude-code-ide-review-hunk-added hunk) 'added
-                           (claude-code-ide-review-hunk-new-start hunk) index)
-                          (claude-code-ide-review--block-rows
-                           index hunk (car claude-status) (cdr claude-status) 'claude)
-                          (claude-code-ide-review--block-rows
-                           index hunk (car user-status) (cdr user-status) 'user))
-                    index))
-          (setq old-pos (+ old-pos span (claude-code-ide-review-hunk-old-count hunk))
-                new-pos (+ new-pos span (claude-code-ide-review-hunk-new-count hunk)))))
-    ;; Unchanged span after the last hunk
-    (let ((lines (seq-subseq old-lines (min (1- old-pos) (length old-lines)))))
-      (funcall append-segment
-               (claude-code-ide-review--pad-segment
-                (list (claude-code-ide-review--context-rows lines old-pos (consp hunks) nil)
-                      (claude-code-ide-review--context-rows lines new-pos (consp hunks) nil)
-                      '() '())
-                nil)))
-    (vconcat panes)))
-
-(defun claude-code-ide-review--hunk-line-range (rows hunk-index)
-  "Return (FIRST . LAST), the 1-based line range of HUNK-INDEX in ROWS, or nil."
-  (let ((first nil)
-        (last nil))
-    (cl-loop for row in rows
-             for line from 1
-             when (eql (claude-code-ide-review-row-hunk row) hunk-index)
-             do (setq first (or first line)
-                      last line))
-    (and first (cons first last))))
-
-;;; Rendering rows into buffers
-
-(defconst claude-code-ide-review--pane-names '("old" "new" "claude" "user")
-  "Buffer name component of panes 0 to 3.")
-
-(defvar-local claude-code-ide-review--rows nil
-  "Row list this review buffer was rendered from.")
-
-(defvar-local claude-code-ide-review--file nil
-  "File, relative to the repository toplevel, shown in this review buffer.")
-
-(defvar-local claude-code-ide-review--project-dir nil
-  "Project directory this review buffer belongs to.")
-
-(defun claude-code-ide-review--pane-buffer (pane file)
-  "Return the buffer of PANE (0 to 3) for FILE, creating it if needed."
-  (get-buffer-create (format "*claude-review: %s %s*"
-                             (nth pane claude-code-ide-review--pane-names) file)))
-
-(defun claude-code-ide-review--row-face (row)
-  "Return the face for ROW, or nil for plain text."
-  (pcase (claude-code-ide-review-row-kind row)
-    ('removed 'claude-code-ide-review-removed)
-    ('added 'claude-code-ide-review-added)
-    ('padding 'claude-code-ide-review-padding)
-    ('fold 'claude-code-ide-review-fold)
-    ('header 'claude-code-ide-review-header)
-    ('placeholder 'claude-code-ide-review-placeholder)
-    (_ nil)))
-
-(defun claude-code-ide-review--insert-row (row)
-  "Insert ROW as one line at point with its text properties.
-Every line carries `claude-review-hunk' (the row's hunk index or nil)
-and `claude-review-kind'; padding rows also carry
-`claude-review-padding' t.  Diff rows show their original line number
-through `line-prefix'."
-  (let ((start (point))
-        (face (claude-code-ide-review--row-face row))
-        (line (claude-code-ide-review-row-line row)))
-    (insert (claude-code-ide-review-row-text row) "\n")
-    (add-text-properties
-     start (point)
-     (append (list 'claude-review-hunk (claude-code-ide-review-row-hunk row)
-                   'claude-review-kind (claude-code-ide-review-row-kind row))
-             (when (eq (claude-code-ide-review-row-kind row) 'padding)
-               (list 'claude-review-padding t))
-             (when face (list 'face face))
-             (when line
-               (list 'line-prefix
-                     (propertize (format "%4d " line)
-                                 'face 'claude-code-ide-review-line-number)))))))
-
-(defun claude-code-ide-review--render-rows (buffer rows)
-  "Replace BUFFER's text with ROWS, one per line; see `--insert-row'.
-The buffer is left read-only with `truncate-lines' on and line numbers
-off, so buffer line equals screen row and the panes can be aligned by
-line number.  Modification hooks are suppressed: the comment pane's
-save-on-change hook must not see the rendering itself."
-  (with-current-buffer buffer
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t))
-      (erase-buffer)
-      (dolist (row rows)
-        (claude-code-ide-review--insert-row row))
-      (setq claude-code-ide-review--rows rows)
-      (setq truncate-lines t)
-      (when (bound-and-true-p display-line-numbers-mode)
-        (display-line-numbers-mode -1))
-      (setq buffer-read-only t)
-      (goto-char (point-min)))
-    buffer))
-
-(defun claude-code-ide-review-render-file (project-dir file)
-  "Build and render the four pane buffers for FILE in PROJECT-DIR.
-Returns the list of buffers, panes 0 to 3."
-  (let ((rows (claude-code-ide-review--build-rows project-dir file)))
-    (cl-loop for pane from 0 to 3
-             collect (let ((buffer (claude-code-ide-review--pane-buffer pane file)))
-                       (claude-code-ide-review--render-rows buffer (aref rows pane))
-                       (with-current-buffer buffer
-                         (setq claude-code-ide-review--file file
-                               claude-code-ide-review--project-dir project-dir))
-                       buffer))))
-
-;;; View: windows, navigation, file switching
-
-(defface claude-code-ide-review-current
-  '((t :inherit highlight))
-  "Face of the current hunk's block in every pane."
-  :group 'claude-code-ide-review)
+;;; View: an ediff session with justification and comment windows below
 
 (cl-defstruct claude-code-ide-review-view
   "The one open review view."
-  project-dir ; project whose baseline is reviewed
-  file        ; file shown, relative to the repository toplevel
-  hunks       ; the file's hunks as rendered, so keystrokes need no git call
-  buffers     ; the four pane buffers, panes 0 to 3
-  windows     ; the four windows showing them, same order
-  hunk        ; index of the current hunk, nil when the file has none
-  overlays    ; one highlight overlay per pane, same order as BUFFERS
-  body-start  ; marker before the editable comment body in pane 3
-  body-end    ; marker on the read-only newline that closes that body
-  watch       ; file-notify descriptor on the shown file's directory, or nil
-  watch-dir   ; the directory WATCH observes
-  timer       ; pending rebuild timer, or nil
-  restore)    ; (tab . NAME) or (winconf . CONFIGURATION), undone by quit
+  project-dir   ; project whose baseline is reviewed
+  file          ; file shown, relative to the repository toplevel
+  hunks         ; the file's hunks from git, in file order
+  hunk          ; index into HUNKS of the hunk under the current difference, or nil
+  control       ; ediff control buffer
+  old-buffer    ; read-only buffer holding the baseline text (ediff buffer A)
+  file-buffer   ; buffer visiting the real file (ediff buffer B)
+  claude-buffer ; window below A: the current hunk's justification
+  user-buffer   ; window below B: the current hunk's comment, editable
+  comment-hunk  ; the hunk USER-BUFFER currently edits, or nil
+  switching     ; non-nil while ediff is restarted on another file
+  watch         ; file-notify descriptor on the shown file's directory, or nil
+  watch-dir     ; the directory WATCH observes
+  timer         ; pending rebuild timer, or nil
+  restore)      ; (tab . NAME) or (winconf . CONFIGURATION), undone by quit
 
 (defvar claude-code-ide-review--view nil
   "The open review view, or nil.  One view per Emacs session.")
-
-(defvar claude-code-ide-review--syncing nil
-  "Non-nil while the panes are being scrolled together, to stop re-entry.")
 
 (defvar claude-code-ide-review-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1202,14 +913,15 @@ Returns the list of buffers, panes 0 to 3."
     (define-key map "o" #'claude-code-ide-review-select-file)
     (define-key map "e" #'claude-code-ide-review-explain-hunk)
     (define-key map "f" #'claude-code-ide-review-finish)
+    (define-key map "c" #'claude-code-ide-review-comment)
     (define-key map "q" #'claude-code-ide-review-quit)
     map)
-  "Keys of panes 0 to 2.")
+  "Keys of the justification window; also added to ediff's control window.")
 
 (define-derived-mode claude-code-ide-review-mode special-mode "Review"
-  "Major mode of the diff panes and the justification pane.
+  "Major mode of the justification window.
 \\{claude-code-ide-review-mode-map}"
-  (setq truncate-lines t))
+  (setq truncate-lines nil))
 
 (defvar claude-code-ide-review-comment-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1221,335 +933,406 @@ Returns the list of buffers, panes 0 to 3."
     (define-key map (kbd "C-c C-f") #'claude-code-ide-review-finish)
     (define-key map (kbd "C-c C-q") #'claude-code-ide-review-quit)
     map)
-  "Keys of the user comment pane.  Plain letters are left free for typing.")
+  "Keys of the comment window.  Plain letters are left free for typing.")
 
 (define-derived-mode claude-code-ide-review-comment-mode text-mode "Review-Comment"
-  "Major mode of the user comment pane.
-\\{claude-code-ide-review-comment-mode-map}"
-  (setq truncate-lines t))
+  "Major mode of the comment window.
+\\{claude-code-ide-review-comment-mode-map}")
 
 (defun claude-code-ide-review--view-check ()
   "Return the open view or signal a `user-error'."
   (or claude-code-ide-review--view
       (user-error "No review view is open; use claude-code-ide-review-open")))
 
-(defun claude-code-ide-review--line-position (line)
-  "Return the position of the start of LINE (1-based) in the current buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (forward-line (1- line))
-    (point)))
-
-(defun claude-code-ide-review--prepare-buffer (buffer pane project-dir)
-  "Give BUFFER of PANE its major mode and PROJECT-DIR as default directory.
-The mode is set before rendering, because changing a major mode kills
-the buffer-local variables rendering stores."
-  (with-current-buffer buffer
-    (let ((mode (if (= pane 3)
-                    'claude-code-ide-review-comment-mode
-                  'claude-code-ide-review-mode)))
-      (unless (derived-mode-p mode)
-        (funcall mode)))
-    (setq default-directory project-dir)))
-
-(defun claude-code-ide-review--update-mode-line (view)
-  "Show file, hunk position and HEAD state in pane 0's mode line for VIEW."
-  (with-current-buffer (car (claude-code-ide-review-view-buffers view))
-    (let ((count (length (claude-code-ide-review-view-hunks view))))
-      (setq mode-line-format
-            (list " " (claude-code-ide-review-view-file view)
-                  (if (claude-code-ide-review-view-hunk view)
-                      (format "  hunk %d/%d" (1+ (claude-code-ide-review-view-hunk view)) count)
-                    "  no hunks")
-                  (if (claude-code-ide-review-head-moved-p
-                       (claude-code-ide-review-view-project-dir view))
-                      "  HEAD moved"
-                    "")))
-      (force-mode-line-update))))
-
-(defun claude-code-ide-review--sync-windows (source)
-  "Make every other pane window start at the same line as SOURCE.
-All four buffers have the same number of lines, so equal first lines
-mean aligned panes."
-  (when-let* ((view claude-code-ide-review--view)
-              ((window-live-p source)))
-    (let ((line (with-current-buffer (window-buffer source)
-                  (line-number-at-pos (window-start source)))))
-      (dolist (window (claude-code-ide-review-view-windows view))
-        (when (and (window-live-p window) (not (eq window source)))
-          (with-current-buffer (window-buffer window)
-            (set-window-start window (claude-code-ide-review--line-position line) t)))))))
-
-(defun claude-code-ide-review--on-scroll (window _start)
-  "`window-scroll-functions' member: follow WINDOW when it is a pane."
-  (when (and claude-code-ide-review--view
-             (not claude-code-ide-review--syncing)
-             (memq window (claude-code-ide-review-view-windows claude-code-ide-review--view)))
-    (let ((claude-code-ide-review--syncing t))
-      (claude-code-ide-review--sync-windows window))))
-
-(defun claude-code-ide-review--scroll-to-line (view line)
-  "Start every window of VIEW at LINE."
-  (let ((claude-code-ide-review--syncing t))
-    (dolist (window (claude-code-ide-review-view-windows view))
-      (when (window-live-p window)
-        (with-current-buffer (window-buffer window)
-          (set-window-start window (claude-code-ide-review--line-position (max 1 line)) t))))))
-
-;;; Editable comment body in pane 3
-
-(defun claude-code-ide-review--comment-buffer (view)
-  "Return VIEW's pane 3 buffer."
-  (nth 3 (claude-code-ide-review-view-buffers view)))
-
-(defun claude-code-ide-review--init-comment-pane (view)
-  "Make VIEW's pane 3 a writable buffer whose text is all read-only.
-The current hunk's body is opened by `--set-editable-block'.  The
-save-on-change hook is installed buffer-locally."
-  (with-current-buffer (claude-code-ide-review--comment-buffer view)
-    (setq buffer-read-only nil)
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t))
-      (put-text-property (point-min) (point-max) 'read-only t))
-    (unless (markerp (claude-code-ide-review-view-body-start view))
-      (setf (claude-code-ide-review-view-body-start view) (make-marker)
-            (claude-code-ide-review-view-body-end view) (make-marker))
-      (set-marker-insertion-type (claude-code-ide-review-view-body-end view) t))
-    (add-hook 'after-change-functions #'claude-code-ide-review--comment-changed nil t)))
-
-(defun claude-code-ide-review--body-bounds (rows index)
-  "Return (FIRST . LAST) line numbers of hunk INDEX's note rows in ROWS, or nil."
-  (let ((first nil)
-        (last nil))
-    (cl-loop for row in rows
-             for line from 1
-             when (and (eql (claude-code-ide-review-row-hunk row) index)
-                       (eq (claude-code-ide-review-row-kind row) 'note))
-             do (setq first (or first line)
-                      last line))
-    (and first (cons first last))))
-
-(defun claude-code-ide-review--set-editable-block (view index)
-  "Make hunk INDEX's comment body the only writable text of VIEW's pane 3.
-The body is the text of the hunk's note rows up to, not including, its
-closing newline, which stays read-only so the body cannot be joined
-with the row below.  The header line's newline becomes rear-nonsticky
-so typing into an empty body is allowed and inherits none of the
-header's properties."
-  (with-current-buffer (claude-code-ide-review--comment-buffer view)
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t)
-          (body-start (claude-code-ide-review-view-body-start view))
-          (body-end (claude-code-ide-review-view-body-end view)))
-      (put-text-property (point-min) (point-max) 'read-only t)
-      (remove-list-of-text-properties (point-min) (point-max) '(rear-nonsticky))
-      (if-let* ((bounds (and index
-                             (claude-code-ide-review--body-bounds
-                              claude-code-ide-review--rows index))))
-          (let ((start (claude-code-ide-review--line-position (car bounds)))
-                (end (1- (claude-code-ide-review--line-position (1+ (cdr bounds))))))
-            (remove-list-of-text-properties start end '(read-only))
-            (put-text-property (1- start) start 'rear-nonsticky t)
-            (set-marker body-start start)
-            (set-marker body-end end))
-        (set-marker body-start nil)
-        (set-marker body-end nil)))))
-
-(defun claude-code-ide-review--body-text (view)
-  "Return the current comment body of VIEW's pane 3 as a string."
-  (with-current-buffer (claude-code-ide-review--comment-buffer view)
-    (buffer-substring-no-properties (claude-code-ide-review-view-body-start view)
-                                    (claude-code-ide-review-view-body-end view))))
-
-(defun claude-code-ide-review--insert-lines (buffer line rows)
-  "Insert ROWS as lines before LINE in BUFFER and splice them into its row list.
-In pane 3 the new text is read-only like the rest of the frame."
-  (with-current-buffer buffer
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t))
-      (save-excursion
-        (goto-char (claude-code-ide-review--line-position line))
-        (let ((start (point)))
-          (dolist (row rows)
-            (claude-code-ide-review--insert-row row))
-          (when (derived-mode-p 'claude-code-ide-review-comment-mode)
-            (put-text-property start (point) 'read-only t))))
-      (setq claude-code-ide-review--rows
-            (append (seq-take claude-code-ide-review--rows (1- line))
-                    rows
-                    (seq-drop claude-code-ide-review--rows (1- line)))))))
-
-(defun claude-code-ide-review--delete-lines (buffer line count)
-  "Delete COUNT lines starting at LINE in BUFFER and from its row list."
-  (with-current-buffer buffer
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t))
-      (delete-region (claude-code-ide-review--line-position line)
-                     (claude-code-ide-review--line-position (+ line count)))
-      (setq claude-code-ide-review--rows
-            (append (seq-take claude-code-ide-review--rows (1- line))
-                    (seq-drop claude-code-ide-review--rows (+ line count -1)))))))
-
-(defun claude-code-ide-review--restretch-overlays (view index)
-  "Cover hunk INDEX's block with VIEW's highlight overlay in every pane."
-  (cl-loop for buffer in (claude-code-ide-review-view-buffers view)
-           for overlay in (claude-code-ide-review-view-overlays view)
-           do (with-current-buffer buffer
-                (when-let* ((range (claude-code-ide-review--hunk-line-range
-                                    claude-code-ide-review--rows index)))
-                  (move-overlay overlay
-                                (claude-code-ide-review--line-position (car range))
-                                (claude-code-ide-review--line-position (1+ (cdr range)))
-                                buffer)))))
-
-(defun claude-code-ide-review--fit-block (view)
-  "Re-align the panes after the comment body of VIEW's current hunk changed.
-Growth first consumes pane 3's own padding rows for the hunk; beyond
-that, the other three panes get padding rows at the block's end so the
-next hunk still starts on the same line everywhere.  Shrinking pads
-pane 3 only; `claude-code-ide-review-refresh' recomputes a tight layout."
-  (let* ((index (claude-code-ide-review-view-hunk view))
-         (pane3 (claude-code-ide-review--comment-buffer view))
-         (rows3 (buffer-local-value 'claude-code-ide-review--rows pane3))
-         (body-lines (1+ (cl-count ?\n (claude-code-ide-review--body-text view))))
-         (note-rows (cl-count-if (lambda (row)
-                                   (and (eql (claude-code-ide-review-row-hunk row) index)
-                                        (eq (claude-code-ide-review-row-kind row) 'note)))
-                                 rows3))
-         (padding-rows (cl-count-if (lambda (row)
-                                      (and (eql (claude-code-ide-review-row-hunk row) index)
-                                           (eq (claude-code-ide-review-row-kind row) 'padding)))
-                                    rows3))
-         (delta (- body-lines note-rows))
-         (body (claude-code-ide-review--body-bounds rows3 index)))
-    (unless (zerop delta)
-      ;; Bring pane 3's row list in step with the text the user typed
-      (with-current-buffer pane3
-        (setq claude-code-ide-review--rows
-              (if (> delta 0)
-                  (append (seq-take rows3 (cdr body))
-                          (cl-loop repeat delta
-                                   collect (make-claude-code-ide-review-row
-                                            :text "" :kind 'note :hunk index))
-                          (seq-drop rows3 (cdr body)))
-                (append (seq-take rows3 (+ (cdr body) delta))
-                        (seq-drop rows3 (cdr body))))))
-      (let ((block-end (cdr (claude-code-ide-review--hunk-line-range
-                             (buffer-local-value 'claude-code-ide-review--rows pane3)
-                             index))))
-        (cond
-         ((> delta 0)
-          (let* ((consume (min delta padding-rows))
-                 (extra (- delta consume)))
-            (when (> consume 0)
-              (claude-code-ide-review--delete-lines pane3 (1+ (- block-end consume)) consume))
-            (when (> extra 0)
-              (dolist (buffer (seq-take (claude-code-ide-review-view-buffers view) 3))
-                (let ((end (cdr (claude-code-ide-review--hunk-line-range
-                                 (buffer-local-value 'claude-code-ide-review--rows buffer)
-                                 index))))
-                  (claude-code-ide-review--insert-lines
-                   buffer (1+ end) (claude-code-ide-review--padding-rows extra index)))))))
-         (t
-          (claude-code-ide-review--insert-lines
-           pane3 (1+ block-end) (claude-code-ide-review--padding-rows (- delta) index)))))
-      (claude-code-ide-review--restretch-overlays view index))))
-
-(defun claude-code-ide-review--comment-changed (_beg _end _len)
-  "Save the edited comment body and keep the panes aligned.
-Runs from `after-change-functions' in pane 3; everything outside the
-body is read-only, so any change the user makes is inside it."
-  (when-let* ((view claude-code-ide-review--view)
-              (index (claude-code-ide-review-view-hunk view))
-              (hunk (nth index (claude-code-ide-review-view-hunks view)))
-              ((marker-position (claude-code-ide-review-view-body-start view))))
-    (let ((dir (claude-code-ide-review-view-project-dir view))
-          (text (claude-code-ide-review--body-text view)))
-      ;; Typed text inherits nothing from the non-sticky header newline, so
-      ;; stamp the body with the properties every other row carries
-      (with-current-buffer (claude-code-ide-review--comment-buffer view)
-        (let ((inhibit-modification-hooks t))
-          (add-text-properties (claude-code-ide-review-view-body-start view)
-                               (claude-code-ide-review-view-body-end view)
-                               (list 'claude-review-hunk index
-                                     'claude-review-kind 'note))))
-      (if (string-blank-p text)
-          (claude-code-ide-review-remove-note dir (claude-code-ide-review-hunk-id hunk) 'user)
-        (claude-code-ide-review-put-note dir hunk 'user text))
-      (claude-code-ide-review--fit-block view))))
-
-(defun claude-code-ide-review-select-hunk (index)
-  "Make hunk INDEX current in the open view.
-Moves the highlight overlays, puts point on the hunk's first line in
-every pane (on the comment body in pane 3), opens that body for
-editing and scrolls the panes so the hunk sits near the top."
-  (let* ((view (claude-code-ide-review--view-check))
-         (first nil))
-    (setf (claude-code-ide-review-view-hunk view) index)
-    (cl-loop for buffer in (claude-code-ide-review-view-buffers view)
-             for window in (claude-code-ide-review-view-windows view)
-             for overlay in (claude-code-ide-review-view-overlays view)
-             do (with-current-buffer buffer
-                  (if-let* ((range (and index
-                                        (claude-code-ide-review--hunk-line-range
-                                         claude-code-ide-review--rows index))))
-                      (let ((start (claude-code-ide-review--line-position (car range)))
-                            (end (claude-code-ide-review--line-position (1+ (cdr range)))))
-                        (setq first (car range))
-                        (move-overlay overlay start end buffer)
-                        (goto-char start)
-                        (when (window-live-p window)
-                          (set-window-point window start)))
-                    (move-overlay overlay (point-min) (point-min) buffer))))
-    (claude-code-ide-review--set-editable-block view index)
-    (when-let* ((body-start (claude-code-ide-review-view-body-start view))
-                ((marker-position body-start)))
-      (with-current-buffer (claude-code-ide-review--comment-buffer view)
-        (goto-char body-start)
-        (let ((window (nth 3 (claude-code-ide-review-view-windows view))))
-          (when (window-live-p window)
-            (set-window-point window body-start)))))
-    (when first
-      (claude-code-ide-review--scroll-to-line view (- first 2)))
-    (claude-code-ide-review--update-mode-line view)
-    index))
-
-(defun claude-code-ide-review-next-hunk ()
-  "Make the next hunk current."
-  (interactive)
-  (let* ((view (claude-code-ide-review--view-check))
-         (hunk (claude-code-ide-review-view-hunk view))
-         (count (length (claude-code-ide-review-view-hunks view))))
-    (cond
-     ((null hunk) (message "This file has no hunks"))
-     ((>= (1+ hunk) count) (message "Last hunk"))
-     (t (claude-code-ide-review-select-hunk (1+ hunk))))))
-
-(defun claude-code-ide-review-previous-hunk ()
-  "Make the previous hunk current."
-  (interactive)
-  (let* ((view (claude-code-ide-review--view-check))
-         (hunk (claude-code-ide-review-view-hunk view)))
-    (cond
-     ((null hunk) (message "This file has no hunks"))
-     ((= hunk 0) (message "First hunk"))
-     (t (claude-code-ide-review-select-hunk (1- hunk))))))
-
-(defun claude-code-ide-review--kill-pane-buffers (view)
-  "Kill VIEW's pane buffers and delete its overlays."
-  (dolist (overlay (claude-code-ide-review-view-overlays view))
-    (delete-overlay overlay))
-  (dolist (buffer (claude-code-ide-review-view-buffers view))
-    (when (buffer-live-p buffer)
-      (kill-buffer buffer)))
-  (setf (claude-code-ide-review-view-overlays view) nil
-        (claude-code-ide-review-view-buffers view) nil))
-
 (defun claude-code-ide-review--file-path (project-dir file)
   "Return the absolute path of FILE, relative to PROJECT-DIR's repository toplevel."
   (expand-file-name file
                     (claude-code-ide-review-baseline-toplevel
                      (claude-code-ide-review-baseline project-dir))))
+
+(defun claude-code-ide-review--old-buffer (project-dir file)
+  "Return a fresh read-only buffer holding FILE's baseline text.
+It gets the major mode the real file would, for the same highlighting."
+  (let ((buffer (get-buffer-create (format "*claude-review: baseline %s*" file)))
+        (path (claude-code-ide-review--file-path project-dir file)))
+    (with-current-buffer buffer
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (claude-code-ide-review-baseline-content project-dir file))
+      (goto-char (point-min))
+      (let ((buffer-file-name path))
+        (ignore-errors (set-auto-mode)))
+      (setq default-directory (file-name-directory path))
+      (set-buffer-modified-p nil)
+      (setq buffer-read-only t))
+    buffer))
+
+(defun claude-code-ide-review--side-buffer (view name mode)
+  "Return VIEW's bottom buffer called NAME in major MODE, creating it."
+  (let ((buffer (get-buffer-create (format "*claude-review: %s*" name))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p mode)
+        (funcall mode))
+      (setq default-directory (claude-code-ide-review-view-project-dir view)))
+    buffer))
+
+;;; View: window layout
+
+(defvar ediff-window-A)
+(defvar ediff-window-B)
+(defvar ediff-control-window)
+(defvar ediff-current-difference)
+(defvar ediff-number-of-differences)
+(defvar ediff-buffer-A)
+(defvar ediff-buffer-B)
+(defvar ediff-control-buffer)
+(defvar ediff-mode-map)
+(defvar ediff-after-quit-hook-internal)
+(defvar ediff-window-setup-function)
+(defvar ediff-split-window-function)
+(declare-function ediff-buffers "ediff" (buffer-a buffer-b &optional startup-hooks job-name))
+(declare-function ediff-setup-control-buffer "ediff-wind" (ctl-buf))
+(declare-function ediff-destroy-control-frame "ediff-wind" (ctl-buf))
+(declare-function ediff-get-diff-posn "ediff-util" (buf-type pos &optional n control-buf))
+(declare-function ediff-jump-to-difference "ediff-util" (difference-number))
+(declare-function ediff-next-difference "ediff-util" (&optional arg))
+(declare-function ediff-previous-difference "ediff-util" (&optional arg))
+(declare-function ediff-really-quit "ediff-util" (reverse-default-keep-variants))
+(declare-function ediff-update-diffs "ediff-util" ())
+
+(defun claude-code-ide-review--setup-windows (buffer-a buffer-b _buffer-c control-buffer)
+  "Arrange the review windows; the view's `ediff-window-setup-function'.
+BUFFER-A and BUFFER-B fill the top row.  Below them the justification
+and comment windows take `claude-code-ide-review-comment-lines' lines,
+and CONTROL-BUFFER sits at the bottom.  Called by ediff at setup and
+whenever it decides the windows need rebuilding."
+  (ediff-destroy-control-frame control-buffer)
+  (let ((view claude-code-ide-review--view)
+        (window-min-height 1))
+    (when (or (window-minibuffer-p) (window-parameter nil 'window-side))
+      (select-window (window-main-window)))
+    (delete-other-windows)
+    (set-window-dedicated-p (selected-window) nil)
+    (let* ((window-a (selected-window))
+           ;; Sizes count the mode line, and the comment windows carry a
+           ;; header line too; the control window gets 3 and shrinks
+           (window-claude (split-window window-a
+                                        (- (+ claude-code-ide-review-comment-lines 5))
+                                        'below))
+           (window-control (split-window window-claude -3 'below))
+           (window-b (split-window window-a nil 'right))
+           (window-user (split-window window-claude nil 'right)))
+      (set-window-buffer window-a buffer-a)
+      (set-window-buffer window-b buffer-b)
+      (when view
+        (set-window-buffer window-claude (claude-code-ide-review-view-claude-buffer view))
+        (set-window-buffer window-user (claude-code-ide-review-view-user-buffer view)))
+      (set-window-buffer window-control control-buffer)
+      (with-current-buffer control-buffer
+        (setq ediff-window-A window-a
+              ediff-window-B window-b
+              ediff-control-window window-control))
+      (select-window window-control)
+      (ediff-setup-control-buffer control-buffer))))
+
+(defun claude-code-ide-review--after-setup-windows ()
+  "`ediff-after-setup-windows-hook' member: restore our layout when lost.
+On a text terminal ediff forces its plain layout on every window
+rebuild, which drops the bottom windows; put them back for our session."
+  (when-let* ((view claude-code-ide-review--view)
+              ((eq (current-buffer) (claude-code-ide-review-view-control view)))
+              ((not (get-buffer-window (claude-code-ide-review-view-user-buffer view)))))
+    (claude-code-ide-review--setup-windows ediff-buffer-A ediff-buffer-B nil (current-buffer))))
+
+;;; View: the current difference and the bottom windows
+
+(defun claude-code-ide-review--difference-lines (view n)
+  "Return (START . END) working-file lines of ediff difference N in VIEW.
+A difference that adds nothing in the working file, a pure deletion,
+reports the one line git would, so the hunk lookup still matches."
+  (with-current-buffer (claude-code-ide-review-view-control view)
+    (let ((beg (ediff-get-diff-posn 'B 'beg n))
+          (end (ediff-get-diff-posn 'B 'end n)))
+      (with-current-buffer ediff-buffer-B
+        (let ((start (line-number-at-pos beg)))
+          (if (= beg end)
+              ;; An empty region sits where the deleted lines were; git
+              ;; reports the line before it, so cover both
+              (cons (max 0 (1- start)) start)
+            ;; END is the start of the line after the region, so the
+            ;; character before it ends the last changed line
+            (cons start (line-number-at-pos (1- end)))))))))
+
+(defun claude-code-ide-review--difference-count (view)
+  "Return the number of ediff differences in VIEW."
+  (with-current-buffer (claude-code-ide-review-view-control view)
+    ediff-number-of-differences))
+
+(defun claude-code-ide-review--current-difference (view)
+  "Return the index of VIEW's selected ediff difference, or nil."
+  (with-current-buffer (claude-code-ide-review-view-control view)
+    (and (>= ediff-current-difference 0)
+         (< ediff-current-difference ediff-number-of-differences)
+         ediff-current-difference)))
+
+(defun claude-code-ide-review--hunk-for-difference (view n)
+  "Return the index in VIEW's hunks of the hunk under ediff difference N, or nil."
+  (let* ((range (claude-code-ide-review--difference-lines view n))
+         (hunk (claude-code-ide-review-hunk-at (claude-code-ide-review-view-project-dir view)
+                                               (claude-code-ide-review-view-file view)
+                                               (car range) (cdr range))))
+    (and hunk (cl-position hunk (claude-code-ide-review-view-hunks view)
+                           :test (lambda (a b)
+                                   (equal (claude-code-ide-review-hunk-id a)
+                                          (claude-code-ide-review-hunk-id b)))))))
+
+(defun claude-code-ide-review--current-hunk (view)
+  "Return the hunk struct under VIEW's current difference, or nil."
+  (when-let* ((index (claude-code-ide-review-view-hunk view)))
+    (nth index (claude-code-ide-review-view-hunks view))))
+
+(defun claude-code-ide-review--header-line (hunk status)
+  "Return the header shown above a justification or comment for HUNK."
+  (propertize (format "%s  %s" (claude-code-ide-review--hunk-range-string hunk) status)
+              'face 'claude-code-ide-review-header))
+
+(defun claude-code-ide-review--fill-claude-buffer (view)
+  "Show the justification of VIEW's current hunk in the left bottom window."
+  (let* ((dir (claude-code-ide-review-view-project-dir view))
+         (hunk (claude-code-ide-review--current-hunk view))
+         (status (and hunk (claude-code-ide-review-hunk-status dir hunk 'claude
+                                                               (claude-code-ide-review-view-hunks view)))))
+    (with-current-buffer (claude-code-ide-review-view-claude-buffer view)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (cond
+         ((null hunk)
+          (insert (propertize "No hunk matches this difference; refresh with g"
+                              'face 'claude-code-ide-review-placeholder)))
+         ((eq (car status) 'ok)
+          (insert (claude-code-ide-review--header-line hunk "ok") "\n"
+                  (claude-code-ide-review-note-text (cdr status))))
+         (t
+          (insert (claude-code-ide-review--header-line hunk (symbol-name (car status))) "\n"
+                  (propertize (claude-code-ide-review--placeholder-text)
+                              'face 'claude-code-ide-review-placeholder))
+          (when (eq (car status) 'stale)
+            (insert "\n\n" (propertize "Earlier justification: " 'face 'claude-code-ide-review-header)
+                    (claude-code-ide-review-note-text (cdr status))))))
+        (goto-char (point-min))))))
+
+(defun claude-code-ide-review--save-comment (view)
+  "Store the comment window's text as the user note of the hunk it edits."
+  (when-let* ((hunk (claude-code-ide-review-view-comment-hunk view))
+              (buffer (claude-code-ide-review-view-user-buffer view))
+              ((buffer-live-p buffer)))
+    (let ((dir (claude-code-ide-review-view-project-dir view))
+          (text (with-current-buffer buffer (buffer-string))))
+      (if (string-blank-p text)
+          (claude-code-ide-review-remove-note dir (claude-code-ide-review-hunk-id hunk) 'user)
+        (claude-code-ide-review-put-note dir hunk 'user text)))))
+
+(defun claude-code-ide-review--fill-user-buffer (view)
+  "Load VIEW's current hunk's comment into the comment window.
+The previous hunk's text is saved first.  Without a matching hunk the
+window is read-only and says so."
+  (claude-code-ide-review--save-comment view)
+  (let* ((dir (claude-code-ide-review-view-project-dir view))
+         (hunk (claude-code-ide-review--current-hunk view))
+         (note (and hunk (claude-code-ide-review-get-note
+                          dir (claude-code-ide-review-hunk-id hunk) 'user))))
+    (setf (claude-code-ide-review-view-comment-hunk view) hunk)
+    (with-current-buffer (claude-code-ide-review-view-user-buffer view)
+      (let ((inhibit-modification-hooks t)
+            (inhibit-read-only t))
+        (erase-buffer)
+        (if hunk
+            (progn
+              (setq buffer-read-only nil
+                    header-line-format (list " " (claude-code-ide-review--header-line hunk "your comment")))
+              (when note (insert (claude-code-ide-review-note-text note))))
+          (setq header-line-format nil)
+          (insert (propertize "No hunk matches this difference" 'face 'claude-code-ide-review-placeholder))
+          (setq buffer-read-only t))
+        (set-buffer-modified-p nil)
+        (goto-char (point-max))))))
+
+(defun claude-code-ide-review--comment-changed (_beg _end _len)
+  "Save the comment window after every change; `after-change-functions'."
+  (when-let* ((view claude-code-ide-review--view)
+              ((eq (current-buffer) (claude-code-ide-review-view-user-buffer view))))
+    (claude-code-ide-review--save-comment view)))
+
+(defun claude-code-ide-review--update-side-windows (view)
+  "Point VIEW's hunk at the current difference and refill both bottom windows."
+  (setf (claude-code-ide-review-view-hunk view)
+        (when-let* ((n (claude-code-ide-review--current-difference view)))
+          (claude-code-ide-review--hunk-for-difference view n)))
+  (claude-code-ide-review--fill-claude-buffer view)
+  (claude-code-ide-review--fill-user-buffer view))
+
+(defun claude-code-ide-review--on-select ()
+  "`ediff-select-hook' member: follow the difference when the session is ours."
+  (when-let* ((view claude-code-ide-review--view)
+              ((eq (current-buffer) (claude-code-ide-review-view-control view))))
+    (claude-code-ide-review--update-side-windows view)))
+
+;;; View: session lifecycle
+
+(defun claude-code-ide-review--on-ediff-startup (view)
+  "Finish VIEW's setup inside its new ediff control buffer."
+  (setf (claude-code-ide-review-view-control view) (current-buffer))
+  ;; On a text terminal ediff replaces the setup function with its plain
+  ;; layout before building the windows, so set ours in the control
+  ;; buffer for later rebuilds and lay the windows out now
+  (setq-local ediff-window-setup-function #'claude-code-ide-review--setup-windows)
+  (setq-local ediff-split-window-function #'split-window-horizontally)
+  (claude-code-ide-review--setup-windows ediff-buffer-A ediff-buffer-B nil (current-buffer))
+  (setq-local ediff-after-quit-hook-internal
+              (cons (lambda () (claude-code-ide-review--after-quit view))
+                    ediff-after-quit-hook-internal))
+  (dolist (key '("e" "f" "o" "c"))
+    (define-key ediff-mode-map key (lookup-key claude-code-ide-review-mode-map key)))
+  (add-hook 'ediff-select-hook #'claude-code-ide-review--on-select)
+  (add-hook 'ediff-after-setup-windows-hook #'claude-code-ide-review--after-setup-windows)
+  (with-current-buffer (claude-code-ide-review-view-user-buffer view)
+    (add-hook 'after-change-functions #'claude-code-ide-review--comment-changed nil t))
+  (claude-code-ide-review--update-side-windows view)
+  (when (> ediff-number-of-differences 0)
+    (ediff-jump-to-difference 1)))
+
+(defun claude-code-ide-review--start-ediff (view file)
+  "Start VIEW's ediff session on FILE and fill the bottom windows."
+  (let* ((dir (claude-code-ide-review-view-project-dir view))
+         (old (claude-code-ide-review--old-buffer dir file))
+         ;; NOWARN: a buffer left behind by an earlier review whose file
+         ;; changed since must not raise a question; revert it instead
+         (new (find-file-noselect (claude-code-ide-review--file-path dir file) t)))
+    (with-current-buffer new
+      (when (and (not (buffer-modified-p))
+                 (not (verify-visited-file-modtime)))
+        (revert-buffer t t t)))
+    (setf (claude-code-ide-review-view-file view) file
+          (claude-code-ide-review-view-hunks view) (claude-code-ide-review-hunks dir file)
+          (claude-code-ide-review-view-hunk view) nil
+          (claude-code-ide-review-view-comment-hunk view) nil
+          (claude-code-ide-review-view-old-buffer view) old
+          (claude-code-ide-review-view-file-buffer view) new)
+    (let ((ediff-window-setup-function #'claude-code-ide-review--setup-windows)
+          (ediff-split-window-function #'split-window-horizontally))
+      (ediff-buffers old new
+                     (list (lambda () (claude-code-ide-review--on-ediff-startup view)))))
+    (claude-code-ide-review--watch-file view)
+    (unless (claude-code-ide-review-view-hunks view)
+      (if-let* ((next (car (remove file (claude-code-ide-review-changed-files dir)))))
+          (message "%s has no changes left; %s does (o to switch)" file next)
+        (message "%s has no changes left" file)))))
+
+(defun claude-code-ide-review--stop-ediff (view)
+  "End VIEW's ediff session without asking.  The real file buffer is kept."
+  (when-let* ((control (claude-code-ide-review-view-control view))
+              ((buffer-live-p control)))
+    (claude-code-ide-review--save-comment view)
+    (with-current-buffer control
+      (ediff-really-quit nil))))
+
+(defun claude-code-ide-review--after-quit (view)
+  "Clean up after VIEW's ediff session ended, by `q' or by our commands.
+Runs from the control buffer's `ediff-after-quit-hook-internal', after
+ediff's own cleanup.  While VIEW is switching files only the baseline
+buffer goes; otherwise the view closes and the windows are restored."
+  (setf (claude-code-ide-review-view-control view) nil)
+  (when-let* ((old (claude-code-ide-review-view-old-buffer view))
+              ((buffer-live-p old)))
+    (kill-buffer old))
+  (unless (claude-code-ide-review-view-switching view)
+    (remove-hook 'ediff-select-hook #'claude-code-ide-review--on-select)
+    (remove-hook 'ediff-after-setup-windows-hook #'claude-code-ide-review--after-setup-windows)
+    (claude-code-ide-review--unwatch view)
+    (dolist (buffer (list (claude-code-ide-review-view-claude-buffer view)
+                          (claude-code-ide-review-view-user-buffer view)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))
+    (when (eq claude-code-ide-review--view view)
+      (setq claude-code-ide-review--view nil))
+    (pcase (claude-code-ide-review-view-restore view)
+      (`(tab . ,name)
+       (when (fboundp 'tab-bar-close-tab-by-name)
+         (tab-bar-close-tab-by-name name)))
+      (`(winconf . ,configuration)
+       (set-window-configuration configuration)))))
+
+(defun claude-code-ide-review--create-view (project-dir)
+  "Create the view struct for PROJECT-DIR and claim a tab or the frame.
+With `tab-bar-mode' on, the review lives in a new tab named
+claude-review; otherwise the current window configuration is saved for
+quit."
+  (let* ((restore (if (bound-and-true-p tab-bar-mode)
+                      (progn
+                        (tab-bar-new-tab)
+                        (tab-bar-rename-tab "claude-review")
+                        (cons 'tab "claude-review"))
+                    (cons 'winconf (current-window-configuration))))
+         (view (make-claude-code-ide-review-view
+                :project-dir (claude-code-ide-review--normalize-dir project-dir)
+                :restore restore)))
+    (setf (claude-code-ide-review-view-claude-buffer view)
+          (claude-code-ide-review--side-buffer view "claude" 'claude-code-ide-review-mode)
+          (claude-code-ide-review-view-user-buffer view)
+          (claude-code-ide-review--side-buffer view "user" 'claude-code-ide-review-comment-mode))
+    (setq claude-code-ide-review--view view)))
+
+(defun claude-code-ide-review--show-file (view file)
+  "Show FILE in VIEW, ending the ediff session of the previous file first."
+  (if (claude-code-ide-review-view-control view)
+      (progn
+        (setf (claude-code-ide-review-view-switching view) t)
+        (unwind-protect
+            (claude-code-ide-review--stop-ediff view)
+          (setf (claude-code-ide-review-view-switching view) nil))
+        (claude-code-ide-review--start-ediff view file))
+    (claude-code-ide-review--start-ediff view file)))
+
+;;; View: navigation
+
+(defun claude-code-ide-review-select-hunk (index)
+  "Make hunk INDEX of the open view current by selecting its ediff difference."
+  (let* ((view (claude-code-ide-review--view-check))
+         (hunk (nth index (claude-code-ide-review-view-hunks view)))
+         (count (claude-code-ide-review--difference-count view)))
+    (when hunk
+      (let ((start (claude-code-ide-review-hunk-new-start hunk))
+            (end (claude-code-ide-review--range-end (claude-code-ide-review-hunk-new-start hunk)
+                                                    (claude-code-ide-review-hunk-new-count hunk))))
+        (cl-loop for n from 0 below count
+                 for range = (claude-code-ide-review--difference-lines view n)
+                 when (> (claude-code-ide-review--overlap start end (car range) (cdr range)) 0)
+                 do (with-current-buffer (claude-code-ide-review-view-control view)
+                      (ediff-jump-to-difference (1+ n)))
+                 and return n)))))
+
+(defun claude-code-ide-review-next-hunk ()
+  "Select the next difference in the open review."
+  (interactive)
+  (let ((view (claude-code-ide-review--view-check)))
+    (with-current-buffer (claude-code-ide-review-view-control view)
+      (ediff-next-difference))))
+
+(defun claude-code-ide-review-previous-hunk ()
+  "Select the previous difference in the open review."
+  (interactive)
+  (let ((view (claude-code-ide-review--view-check)))
+    (with-current-buffer (claude-code-ide-review-view-control view)
+      (ediff-previous-difference))))
+
+(defun claude-code-ide-review-comment ()
+  "Move to the comment window of the open review."
+  (interactive)
+  (let* ((view (claude-code-ide-review--view-check))
+         (window (get-buffer-window (claude-code-ide-review-view-user-buffer view))))
+    (if (window-live-p window)
+        (select-window window)
+      (user-error "The comment window is not shown"))))
 
 ;;; Live sync
 
@@ -1611,94 +1394,7 @@ into one rebuild."
     (setf (claude-code-ide-review-view-timer view) nil)
     (claude-code-ide-review-refresh)))
 
-(defun claude-code-ide-review--body-offset (view)
-  "Return point's offset into the comment body of VIEW's pane 3, or nil.
-Nil when point is outside the body, so a rebuild leaves it to
-`claude-code-ide-review-select-hunk'."
-  (when-let* ((start (claude-code-ide-review-view-body-start view))
-              (end (claude-code-ide-review-view-body-end view))
-              ((marker-position start)))
-    (with-current-buffer (claude-code-ide-review--comment-buffer view)
-      (when (<= start (point) end)
-        (- (point) start)))))
-
-(defun claude-code-ide-review--goto-body-offset (view offset)
-  "Put point OFFSET characters into the comment body of VIEW's pane 3.
-Clamped to the body, which may have become shorter."
-  (when-let* ((start (claude-code-ide-review-view-body-start view))
-              (end (claude-code-ide-review-view-body-end view))
-              ((marker-position start)))
-    (with-current-buffer (claude-code-ide-review--comment-buffer view)
-      (let ((position (min (+ start offset) (marker-position end)))
-            (window (nth 3 (claude-code-ide-review-view-windows view))))
-        (goto-char position)
-        (when (window-live-p window)
-          (set-window-point window position))))))
-
-(defun claude-code-ide-review--show-file (view file &optional hunk)
-  "Render FILE into VIEW's windows and select HUNK (default 0).
-Starts watching FILE's directory so later changes rebuild the panes."
-  (let ((project-dir (claude-code-ide-review-view-project-dir view))
-        (old-buffers (claude-code-ide-review-view-buffers view)))
-    (setf (claude-code-ide-review-view-file view) file)
-    (dotimes (pane 4)
-      (claude-code-ide-review--prepare-buffer
-       (claude-code-ide-review--pane-buffer pane file) pane project-dir))
-    (let ((buffers (claude-code-ide-review-render-file project-dir file)))
-      (setf (claude-code-ide-review-view-buffers view) buffers)
-      (dolist (overlay (claude-code-ide-review-view-overlays view))
-        (delete-overlay overlay))
-      (setf (claude-code-ide-review-view-overlays view)
-            (mapcar (lambda (buffer)
-                      (let ((overlay (make-overlay 1 1 buffer)))
-                        (overlay-put overlay 'face 'claude-code-ide-review-current)
-                        overlay))
-                    buffers))
-      (cl-loop for buffer in buffers
-               for window in (claude-code-ide-review-view-windows view)
-               do (when (window-live-p window)
-                    ;; `set-window-buffer' refuses a strongly dedicated window
-                    (set-window-dedicated-p window nil)
-                    (set-window-buffer window buffer)
-                    (set-window-dedicated-p window t)))
-      ;; Only now drop the previous file's buffers: killing a buffer that a
-      ;; dedicated window still shows would delete that window
-      (dolist (buffer old-buffers)
-        (when (and (buffer-live-p buffer) (not (memq buffer buffers)))
-          (kill-buffer buffer)))
-      (setf (claude-code-ide-review-view-hunks view)
-            (claude-code-ide-review-hunks project-dir file))
-      (claude-code-ide-review--init-comment-pane view)
-      (let ((count (length (claude-code-ide-review-view-hunks view))))
-        (claude-code-ide-review-select-hunk
-         (and (> count 0) (min (or hunk 0) (1- count)))))
-      (claude-code-ide-review--watch-file view)
-      (unless (claude-code-ide-review-view-hunks view)
-        (if-let* ((next (car (remove file (claude-code-ide-review-changed-files project-dir)))))
-            (message "%s has no changes left; %s does (o to switch)" file next)
-          (message "%s has no changes left" file))))))
-
-(defun claude-code-ide-review--create-view (project-dir)
-  "Set up the 2x2 window grid for PROJECT-DIR and return the new view.
-With `tab-bar-mode' on, the grid lives in a new tab named claude-review;
-otherwise the current window configuration is saved for quit."
-  (let ((restore (if (bound-and-true-p tab-bar-mode)
-                     (progn
-                       (tab-bar-new-tab)
-                       (tab-bar-rename-tab "claude-review")
-                       (cons 'tab "claude-review"))
-                   (cons 'winconf (current-window-configuration)))))
-    (delete-other-windows)
-    (let* ((w0 (selected-window))
-           (w2 (split-window w0 nil 'below))
-           (w1 (split-window w0 nil 'right))
-           (w3 (split-window w2 nil 'right)))
-      (add-hook 'window-scroll-functions #'claude-code-ide-review--on-scroll)
-      (setq claude-code-ide-review--view
-            (make-claude-code-ide-review-view
-             :project-dir (claude-code-ide-review--normalize-dir project-dir)
-             :windows (list w0 w1 w2 w3)
-             :restore restore)))))
+;;; View: commands
 
 (defun claude-code-ide-review--read-changed-file (project-dir)
   "Ask for one of PROJECT-DIR's changed files."
@@ -1709,7 +1405,7 @@ otherwise the current window configuration is saved for quit."
 
 ;;;###autoload
 (defun claude-code-ide-review-open (&optional file)
-  "Open the four-pane review view on FILE, or on the first changed file.
+  "Open the review on FILE, or on the first changed file.
 Interactively, a prefix argument asks which changed file to show.  An
 open view is reused, so the command also switches files."
   (interactive
@@ -1730,7 +1426,6 @@ open view is reused, so the command also switches files."
     (let ((view (or claude-code-ide-review--view
                     (claude-code-ide-review--create-view project-dir))))
       (claude-code-ide-review--show-file view file)
-      (select-window (car (claude-code-ide-review-view-windows view)))
       view)))
 
 (defun claude-code-ide-review-select-file ()
@@ -1742,34 +1437,39 @@ open view is reused, so the command also switches files."
       (claude-code-ide-review-view-project-dir view)))))
 
 (defun claude-code-ide-review-refresh ()
-  "Re-render the file shown in the open view, keeping the current hunk.
-Point in the comment body keeps its offset, so a rebuild caused by a
-change to the file does not move the user's typing position."
+  "Recompute the differences of the open view from the file on disk.
+The real file's buffer is reverted when it has no unsaved changes, the
+hunks and ediff's differences are recomputed, and the bottom windows
+follow the difference that is current afterwards."
   (interactive)
   (let* ((view (claude-code-ide-review--view-check))
-         (offset (claude-code-ide-review--body-offset view)))
-    (claude-code-ide-review--show-file view
-                                       (claude-code-ide-review-view-file view)
-                                       (claude-code-ide-review-view-hunk view))
-    (when offset
-      (claude-code-ide-review--goto-body-offset view offset))))
+         (dir (claude-code-ide-review-view-project-dir view))
+         (file (claude-code-ide-review-view-file view))
+         (file-buffer (claude-code-ide-review-view-file-buffer view)))
+    (claude-code-ide-review--save-comment view)
+    (when (and (buffer-live-p file-buffer)
+               (not (buffer-modified-p file-buffer))
+               (not (verify-visited-file-modtime file-buffer)))
+      (with-current-buffer file-buffer
+        (revert-buffer t t t)))
+    (setf (claude-code-ide-review-view-hunks view) (claude-code-ide-review-hunks dir file))
+    (with-current-buffer (claude-code-ide-review-view-control view)
+      (ediff-update-diffs))
+    (claude-code-ide-review--update-side-windows view)
+    (unless (claude-code-ide-review-view-hunks view)
+      (if-let* ((next (car (remove file (claude-code-ide-review-changed-files dir)))))
+          (message "%s has no changes left; %s does (o to switch)" file next)
+        (message "%s has no changes left" file)))))
 
 ;;;###autoload
 (defun claude-code-ide-review-quit ()
-  "Close the review view and restore the windows or tab it replaced."
+  "Close the review and restore the windows or tab it replaced."
   (interactive)
   (when-let* ((view claude-code-ide-review--view))
-    (remove-hook 'window-scroll-functions #'claude-code-ide-review--on-scroll)
-    (claude-code-ide-review--unwatch view)
-    (claude-code-ide-review--kill-pane-buffers view)
-    (setq claude-code-ide-review--view nil)
-    (pcase (claude-code-ide-review-view-restore view)
-      (`(tab . ,name)
-       (when (fboundp 'tab-bar-close-tab-by-name)
-         (tab-bar-close-tab-by-name name)))
-      (`(winconf . ,configuration)
-       (set-window-configuration configuration)))))
-
+    (if (claude-code-ide-review-view-control view)
+        (claude-code-ide-review--stop-ediff view)
+      ;; No ediff session (it failed to start): close the view by hand
+      (claude-code-ide-review--after-quit view))))
 ;;; Formatting
 
 (defun claude-code-ide-review--short-id (id)
@@ -2246,8 +1946,10 @@ baseline when its first session starts, deletes the pinning refs when
 Emacs exits, registers the review tools Claude can call and the
 `/emacs-tools:review' slash command, and adds the annotation paragraph
 to the system prompt when `claude-code-ide-review-annotate-on-edit'
-is set.  Safe to call more than once."
+is set.  Enables the MCP tools server, which the tools and the slash
+command are served from.  Safe to call more than once."
   (interactive)
+  (setq claude-code-ide-enable-mcp-server t)
   (add-hook 'claude-code-ide-mcp-server-session-started-hook
             #'claude-code-ide-review--on-session-started)
   (add-hook 'claude-code-ide-mcp-server-session-ended-hook

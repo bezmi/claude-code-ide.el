@@ -3715,183 +3715,6 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                                                                 (text (alist-get 'text (car (alist-get 'content result)))))
                                                                                            (should (string-match-p "2 hunks, 1 unexplained" text)))))))
 
-;;; Review Pane Tests
-
-(defun claude-code-ide-review-tests--rows-of (rows kind &optional hunk)
-  "Return the texts of the rows of KIND in ROWS, limited to HUNK when given."
-  (cl-loop for row in rows
-           when (and (eq (claude-code-ide-review-row-kind row) kind)
-                     (or (null hunk) (eql (claude-code-ide-review-row-hunk row) hunk)))
-           collect (claude-code-ide-review-row-text row)))
-
-(defun claude-code-ide-review-tests--kill-panes (file)
-  "Kill the four pane buffers of FILE if they exist."
-  (dotimes (pane 4)
-    (when-let* ((buffer (get-buffer (format "*claude-review: %s %s*"
-                                            (nth pane claude-code-ide-review--pane-names) file))))
-      (kill-buffer buffer))))
-
-(ert-deftest claude-code-ide-review-test-rows-align ()
-  "The four row lists have equal length and every hunk spans the same lines."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-put-note repo (nth 0 hunks) 'user "Keep the word")
-                                             (claude-code-ide-review-put-note repo (nth 1 hunks) 'claude "Added the fourth step")
-                                             (let ((panes (claude-code-ide-review--build-rows repo "a.txt")))
-                                               (should (= (length panes) 4))
-                                               (should (apply #'= (mapcar #'length panes)))
-                                               (dotimes (hunk 2)
-                                                 (let ((ranges (mapcar (lambda (rows) (claude-code-ide-review--hunk-line-range rows hunk))
-                                                                       panes)))
-                                                   (should (car ranges))
-                                                   (should (cl-every (lambda (range) (equal range (car ranges))) ranges))))
-                                               ;; Hunk 1 starts after hunk 0 ends
-                                               (should (> (car (claude-code-ide-review--hunk-line-range (aref panes 0) 1))
-                                                          (cdr (claude-code-ide-review--hunk-line-range (aref panes 0) 0))))))))
-
-(ert-deftest claude-code-ide-review-test-rows-content ()
-  "Each pane carries the right text, kinds and line numbers for each hunk."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-put-note repo (nth 0 hunks) 'user "Keep the word")
-                                             (claude-code-ide-review-put-note repo (nth 1 hunks) 'claude "Added the fourth step")
-                                             (let* ((panes (claude-code-ide-review--build-rows repo "a.txt"))
-                                                    (old (aref panes 0))
-                                                    (new (aref panes 1))
-                                                    (claude (aref panes 2))
-                                                    (user (aref panes 3)))
-                                               ;; Diff panes
-                                               (should (equal (claude-code-ide-review-tests--rows-of old 'removed 0) '("two")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of new 'added 0) '("2")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of old 'removed 1) nil))
-                                               (should (equal (claude-code-ide-review-tests--rows-of new 'added 1) '("four")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of old 'context) '("one" "three")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of new 'context) '("one" "three")))
-                                               (let ((removed (seq-find (lambda (r) (eq (claude-code-ide-review-row-kind r) 'removed)) old))
-                                                     (added (seq-find (lambda (r) (and (eq (claude-code-ide-review-row-kind r) 'added)
-                                                                                       (eql (claude-code-ide-review-row-hunk r) 1)))
-                                                                      new)))
-                                                 (should (= (claude-code-ide-review-row-line removed) 2))
-                                                 (should (= (claude-code-ide-review-row-line added) 4)))
-                                               ;; Pane 0 has no text for the pure insertion, so it is padding there
-                                               (should (claude-code-ide-review-tests--rows-of old 'padding 1))
-                                               ;; Claude pane: placeholder for hunk 0, note for hunk 1
-                                               (should (equal (claude-code-ide-review-tests--rows-of claude 'header)
-                                                              '("#1 a.txt:2-2" "#2 a.txt:4-4")))
-                                               (should (string-match-p "Claude did not leave a comment"
-                                                                       (car (claude-code-ide-review-tests--rows-of claude 'placeholder 0))))
-                                               (should-not (claude-code-ide-review-tests--rows-of claude 'placeholder 1))
-                                               (should (equal (claude-code-ide-review-tests--rows-of claude 'note 1) '("Added the fourth step")))
-                                               ;; User pane: text for hunk 0, one empty row for hunk 1
-                                               (should (equal (claude-code-ide-review-tests--rows-of user 'note 0) '("Keep the word")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of user 'note 1) '("")))
-                                               (should-not (claude-code-ide-review-tests--rows-of user 'placeholder))))))
-
-(ert-deftest claude-code-ide-review-test-rows-fold ()
-  "Long unchanged spans fold to the context limit; nil shows every line."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((lines (cl-loop for i from 1 to 40 collect (format "L%d" i))))
-                                             (claude-code-ide-review-tests--write repo "long.txt" (concat (string-join lines "\n") "\n"))
-                                             (claude-code-ide-review-tests--git repo "add" "long.txt")
-                                             (claude-code-ide-review-tests--git repo "commit" "-q" "-m" "long")
-                                             (claude-code-ide-review--snapshot repo "sid-1")
-                                             (setf (nth 4 lines) "L5x"
-                                                   (nth 34 lines) "L35x")
-                                             (claude-code-ide-review-tests--write repo "long.txt" (concat (string-join lines "\n") "\n"))
-                                             (let ((claude-code-ide-review-context-lines 3))
-                                               (let* ((panes (claude-code-ide-review--build-rows repo "long.txt"))
-                                                      (old (aref panes 0)))
-                                                 (should (apply #'= (mapcar #'length panes)))
-                                                 ;; Leading 4 lines are kept whole (not longer than 3 + 1)
-                                                 (should (equal (seq-take (claude-code-ide-review-tests--rows-of old 'context) 4)
-                                                                '("L1" "L2" "L3" "L4")))
-                                                 ;; 29 lines between the hunks: 3 + fold(23) + 3
-                                                 (should (equal (claude-code-ide-review-tests--rows-of old 'fold)
-                                                                '("⋯ 23 unchanged lines ⋯" "⋯ 2 unchanged lines ⋯")))
-                                                 (should (member "L6" (claude-code-ide-review-tests--rows-of old 'context)))
-                                                 (should-not (member "L20" (claude-code-ide-review-tests--rows-of old 'context)))
-                                                 (should (member "L34" (claude-code-ide-review-tests--rows-of old 'context)))
-                                                 ;; Both diff panes fold identically
-                                                 (should (equal (claude-code-ide-review-tests--rows-of (aref panes 1) 'fold)
-                                                                (claude-code-ide-review-tests--rows-of old 'fold)))))
-                                             (let ((claude-code-ide-review-context-lines nil))
-                                               (let ((old (aref (claude-code-ide-review--build-rows repo "long.txt") 0)))
-                                                 (should-not (claude-code-ide-review-tests--rows-of old 'fold))
-                                                 (should (= (length (claude-code-ide-review-tests--rows-of old 'context)) 38)))))))
-
-(ert-deftest claude-code-ide-review-test-rows-new-and-deleted-file ()
-  "A new file is one added block over padding; a deleted file the reverse."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review--snapshot repo "sid-1")
-                                           (claude-code-ide-review-tests--write repo "new.txt" "alpha\nbeta\n")
-                                           (delete-file (expand-file-name "a.txt" repo))
-                                           (let ((panes (claude-code-ide-review--build-rows repo "new.txt")))
-                                             (should (apply #'= (mapcar #'length panes)))
-                                             (should (equal (claude-code-ide-review-tests--rows-of (aref panes 1) 'added) '("alpha" "beta")))
-                                             (should-not (claude-code-ide-review-tests--rows-of (aref panes 0) 'removed))
-                                             (should (= (length (claude-code-ide-review-tests--rows-of (aref panes 0) 'padding))
-                                                        (length (aref panes 0)))))
-                                           (let ((panes (claude-code-ide-review--build-rows repo "a.txt")))
-                                             (should (apply #'= (mapcar #'length panes)))
-                                             (should (equal (claude-code-ide-review-tests--rows-of (aref panes 0) 'removed) '("one" "two" "three")))
-                                             (should-not (claude-code-ide-review-tests--rows-of (aref panes 1) 'added)))))
-
-(ert-deftest claude-code-ide-review-test-render-properties ()
-  "Rendered buffers have equal line counts and the alignment properties."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-put-note repo (nth 1 hunks) 'claude "Added the fourth step")
-                                             (unwind-protect
-                                                 (let ((buffers (claude-code-ide-review-render-file repo "a.txt")))
-                                                   (should (= (length buffers) 4))
-                                                   (should (equal (mapcar #'buffer-name buffers)
-                                                                  '("*claude-review: old a.txt*" "*claude-review: new a.txt*"
-                                                                    "*claude-review: claude a.txt*" "*claude-review: user a.txt*")))
-                                                   (should (apply #'= (mapcar (lambda (b) (with-current-buffer b (count-lines (point-min) (point-max))))
-                                                                              buffers)))
-                                                   (let* ((old (nth 0 buffers))
-                                                          (range (with-current-buffer old
-                                                                   (claude-code-ide-review--hunk-line-range claude-code-ide-review--rows 1))))
-                                                     ;; The first line of hunk 1 carries the hunk index in every buffer
-                                                     (dolist (buffer buffers)
-                                                       (with-current-buffer buffer
-                                                         (should buffer-read-only)
-                                                         (should truncate-lines)
-                                                         (should (equal claude-code-ide-review--file "a.txt"))
-                                                         (goto-char (point-min))
-                                                         (forward-line (1- (car range)))
-                                                         (should (eql (get-text-property (point) 'claude-review-hunk) 1))))
-                                                     ;; Pane 0 has padding where the insertion has no old text
-                                                     (with-current-buffer old
-                                                       (goto-char (point-min))
-                                                       (forward-line (1- (car range)))
-                                                       (should (get-text-property (point) 'claude-review-padding))
-                                                       ;; The removed row shows its original line number
-                                                       (goto-char (point-min))
-                                                       (search-forward "two")
-                                                       (should (string-match-p "2" (get-text-property (line-beginning-position) 'line-prefix)))
-                                                       (should (eq (get-text-property (line-beginning-position) 'face)
-                                                                   'claude-code-ide-review-removed)))))
-                                               (claude-code-ide-review-tests--kill-panes "a.txt")))))
-
-(ert-deftest claude-code-ide-review-test-stale-header ()
-  "A hunk whose text changed after being noted shows (stale) and the old note."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-put-note repo (nth 1 hunks) 'claude "Added the fourth step")
-                                             (claude-code-ide-review-tests--write repo "a.txt" "one\n2\nthree\nFOUR\n")
-                                             (let ((claude (aref (claude-code-ide-review--build-rows repo "a.txt") 2)))
-                                               (should (equal (claude-code-ide-review-tests--rows-of claude 'header)
-                                                              '("#1 a.txt:2-2" "#2 a.txt:4-4 (stale)")))
-                                               (should (equal (claude-code-ide-review-tests--rows-of claude 'note 1)
-                                                              '("Added the fourth step")))))))
-
 ;;; Review View Tests
 
 (defmacro claude-code-ide-review-tests--with-view (repo file &rest body)
@@ -3905,160 +3728,151 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                        ,@body)
                                                    (claude-code-ide-review-quit)))))
 
-(defun claude-code-ide-review-tests--window-lines (view)
-  "Return the first visible line number of each window of VIEW."
-  (mapcar (lambda (window)
-            (with-current-buffer (window-buffer window)
-              (line-number-at-pos (window-start window))))
-          (claude-code-ide-review-view-windows view)))
+(defun claude-code-ide-review-tests--comment-buffer ()
+  "Return the comment window's buffer of the open view."
+  (claude-code-ide-review-view-user-buffer claude-code-ide-review--view))
 
-(defun claude-code-ide-review-tests--overlay-lines (view)
-  "Return (START . END) line numbers of each highlight overlay of VIEW."
-  (mapcar (lambda (overlay)
-            (with-current-buffer (overlay-buffer overlay)
-              (cons (line-number-at-pos (overlay-start overlay))
-                    (line-number-at-pos (overlay-end overlay)))))
-          (claude-code-ide-review-view-overlays view)))
+(defun claude-code-ide-review-tests--type (text)
+  "Append TEXT to the comment window, as typing would."
+  (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
+    (goto-char (point-max))
+    (insert text)))
 
-(ert-deftest claude-code-ide-review-test-open-layout ()
-  "Opening shows the four panes in four dedicated windows and saves a restore point."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let ((view claude-code-ide-review--view))
-                                                                                      (should view)
-                                                                                      (should (equal (claude-code-ide-review-view-file view) "a.txt"))
-                                                                                      (should (= (length (claude-code-ide-review-view-windows view)) 4))
-                                                                                      (should (cl-every #'window-live-p (claude-code-ide-review-view-windows view)))
-                                                                                      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
-                                                                                                             (claude-code-ide-review-view-windows view))
-                                                                                                     '("*claude-review: old a.txt*" "*claude-review: new a.txt*"
-                                                                                                       "*claude-review: claude a.txt*" "*claude-review: user a.txt*")))
-                                                                                      (should (cl-every #'window-dedicated-p (claude-code-ide-review-view-windows view)))
-                                                                                      (should (eq (car (claude-code-ide-review-view-restore view)) 'winconf))
-                                                                                      (should (memq #'claude-code-ide-review--on-scroll window-scroll-functions))
-                                                                                      ;; Modes: panes 0-2 review-mode and read-only; pane 3 comment-mode, writable
-                                                                                      (should (cl-every (lambda (b) (with-current-buffer b (and (derived-mode-p 'claude-code-ide-review-mode)
-                                                                                                                                                buffer-read-only)))
-                                                                                                        (seq-take (claude-code-ide-review-view-buffers view) 3)))
-                                                                                      (should (with-current-buffer (nth 3 (claude-code-ide-review-view-buffers view))
-                                                                                                (and (derived-mode-p 'claude-code-ide-review-comment-mode)
-                                                                                                     (not buffer-read-only))))
-                                                                                      ;; Rendering survived the mode switch
-                                                                                      (should (with-current-buffer (car (claude-code-ide-review-view-buffers view))
-                                                                                                claude-code-ide-review--rows))))))
+(defun claude-code-ide-review-tests--window-rows ()
+  "Return the top row of every window with its buffer name, sorted by position."
+  (sort (mapcar (lambda (window)
+                  (list (window-top-line window) (window-left-column window)
+                        (buffer-name (window-buffer window))))
+                (window-list))
+        (lambda (a b) (or (< (car a) (car b))
+                          (and (= (car a) (car b)) (< (cadr a) (cadr b)))))))
 
-(ert-deftest claude-code-ide-review-test-select-and-navigate ()
-  "Hunk 0 is current after open; n and p move the highlight and point in every pane."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let ((view claude-code-ide-review--view))
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))
-                                                                                      (claude-code-ide-review-next-hunk)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 1))
-                                                                                      (let* ((rows (with-current-buffer (car (claude-code-ide-review-view-buffers view))
-                                                                                                     claude-code-ide-review--rows))
-                                                                                             (range (claude-code-ide-review--hunk-line-range rows 1))
-                                                                                             (overlays (claude-code-ide-review-tests--overlay-lines view)))
-                                                                                        ;; All four overlays cover the hunk's line range
-                                                                                        (should (cl-every (lambda (o) (equal o (cons (car range) (1+ (cdr range))))) overlays))
-                                                                                        ;; Point is on the hunk's first line in panes 0-2 and on the
-                                                                                        ;; comment body, one line below the header, in pane 3
-                                                                                        (cl-loop for buffer in (claude-code-ide-review-view-buffers view)
-                                                                                                 for window in (claude-code-ide-review-view-windows view)
-                                                                                                 for pane from 0
-                                                                                                 do (let ((expected (if (= pane 3) (1+ (car range)) (car range))))
-                                                                                                      (with-current-buffer buffer
-                                                                                                        (should (= (line-number-at-pos (point)) expected))
-                                                                                                        (should (= (line-number-at-pos (window-point window)) expected)))))
-                                                                                        (should (= (with-current-buffer (nth 3 (claude-code-ide-review-view-buffers view))
-                                                                                                     (line-number-at-pos (claude-code-ide-review-view-body-start view)))
-                                                                                                   (1+ (car range)))))
-                                                                                      ;; No wrapping at the ends
-                                                                                      (claude-code-ide-review-next-hunk)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 1))
-                                                                                      (claude-code-ide-review-previous-hunk)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))
-                                                                                      (claude-code-ide-review-previous-hunk)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))
-                                                                                      ;; Mode line of pane 0 names the file and position
-                                                                                      ;; `format-mode-line' yields "" in batch Emacs, so inspect the
-                                                                                      ;; format itself, which is a list of plain strings here
-                                                                                      (should (string-match-p "a.txt.*hunk 1/2"
-                                                                                                              (mapconcat (lambda (item) (format "%s" item))
-                                                                                                                         (with-current-buffer (car (claude-code-ide-review-view-buffers view))
-                                                                                                                           mode-line-format)
-                                                                                                                         "")))))))
-
-(ert-deftest claude-code-ide-review-test-sync-windows ()
-  "Scrolling one pane to a line brings the other three to the same line."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((lines (cl-loop for i from 1 to 60 collect (format "L%d" i))))
-                                             (claude-code-ide-review-tests--write repo "long.txt" (concat (string-join lines "\n") "\n"))
-                                             (claude-code-ide-review-tests--git repo "add" "long.txt")
-                                             (claude-code-ide-review-tests--git repo "commit" "-q" "-m" "long")
-                                             (claude-code-ide-review--snapshot repo "sid-1")
-                                             (setf (nth 4 lines) "L5x" (nth 54 lines) "L55x")
-                                             (claude-code-ide-review-tests--write repo "long.txt" (concat (string-join lines "\n") "\n"))
-                                             (let ((claude-code-ide-review-context-lines nil))
-                                               (claude-code-ide-review-tests--with-view repo "long.txt"
-                                                                                        (let* ((view claude-code-ide-review--view)
-                                                                                               (source (nth 1 (claude-code-ide-review-view-windows view))))
-                                                                                          ;; Scroll pane 1 to line 30 by hand, then sync from it
-                                                                                          (with-current-buffer (window-buffer source)
-                                                                                            (set-window-start source (claude-code-ide-review--line-position 30) t))
-                                                                                          (claude-code-ide-review--sync-windows source)
-                                                                                          (should (equal (claude-code-ide-review-tests--window-lines view) '(30 30 30 30)))
-                                                                                          ;; Selecting the last hunk scrolls all panes together
-                                                                                          (claude-code-ide-review-select-hunk 1)
-                                                                                          (let ((starts (claude-code-ide-review-tests--window-lines view)))
-                                                                                            (should (apply #'= starts))
-                                                                                            (should (> (car starts) 30)))))))))
-
-(ert-deftest claude-code-ide-review-test-select-file ()
-  "Switching files re-renders into the same windows and drops the old buffers."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--write repo "b.txt" "beta\n")
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let* ((view claude-code-ide-review--view)
-                                                                                           (windows (claude-code-ide-review-view-windows view)))
-                                                                                      (claude-code-ide-review-open "b.txt")
-                                                                                      (should (eq claude-code-ide-review--view view))
-                                                                                      (should (equal (claude-code-ide-review-view-file view) "b.txt"))
-                                                                                      (should (equal (claude-code-ide-review-view-windows view) windows))
-                                                                                      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w))) windows)
-                                                                                                     '("*claude-review: old b.txt*" "*claude-review: new b.txt*"
-                                                                                                       "*claude-review: claude b.txt*" "*claude-review: user b.txt*")))
-                                                                                      (should-not (get-buffer "*claude-review: old a.txt*"))
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))
-                                                                                      ;; Refresh keeps the file and hunk
-                                                                                      (claude-code-ide-review-refresh)
-                                                                                      (should (equal (claude-code-ide-review-view-file view) "b.txt"))
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))))))
-
-(ert-deftest claude-code-ide-review-test-quit-restores ()
-  "Quitting clears the view, the hook and the pane buffers, and restores the windows."
+(ert-deftest claude-code-ide-review-test-ediff-view-layout ()
+  "The view is an ediff session: A and B on top, two short windows below, control last."
   (skip-unless (executable-find "git"))
   (claude-code-ide-review-tests--with-repo repo
                                            (claude-code-ide-review-tests--two-hunks repo)
                                            (claude-code-ide-review-tests--with-session repo
                                                                                        (let ((tab-bar-mode nil)
-                                                                                             (windows-before (length (window-list))))
-                                                                                         (claude-code-ide-review-open "a.txt")
-                                                                                         (should (= (length (window-list)) 4))
-                                                                                         (claude-code-ide-review-quit)
-                                                                                         (should-not claude-code-ide-review--view)
-                                                                                         (should-not (memq #'claude-code-ide-review--on-scroll window-scroll-functions))
-                                                                                         (should-not (get-buffer "*claude-review: user a.txt*"))
-                                                                                         (should (= (length (window-list)) windows-before))
-                                                                                         ;; Quitting again is harmless
-                                                                                         (claude-code-ide-review-quit)))))
+                                                                                             (windows-before (length (window-list)))
+                                                                                             (claude-code-ide-review-comment-lines 4))
+                                                                                         (unwind-protect
+                                                                                             (let* ((view (claude-code-ide-review-open "a.txt"))
+                                                                                                    (rows (claude-code-ide-review-tests--window-rows))
+                                                                                                    (control (claude-code-ide-review-view-control view)))
+                                                                                               (should (= (length rows) 5))
+                                                                                               (should (eq (buffer-local-value 'ediff-control-buffer control) control))
+                                                                                               (should (equal (mapcar #'caddr rows)
+                                                                                                              (list "*claude-review: baseline a.txt*"
+                                                                                                                    (buffer-name (claude-code-ide-review-view-file-buffer view))
+                                                                                                                    "*claude-review: claude*" "*claude-review: user*"
+                                                                                                                    (buffer-name control))))
+                                                                                               ;; A and B share the top row, the comment windows the next one
+                                                                                               (should (= (car (nth 0 rows)) (car (nth 1 rows))))
+                                                                                               (should (= (car (nth 2 rows)) (car (nth 3 rows))))
+                                                                                               (should (< (car (nth 1 rows)) (car (nth 2 rows)) (car (nth 4 rows))))
+                                                                                               (should (= (window-body-height (get-buffer-window (claude-code-ide-review-view-user-buffer view)))
+                                                                                                          4))
+                                                                                               (should (eq (window-buffer (buffer-local-value 'ediff-window-A control))
+                                                                                                           (claude-code-ide-review-view-old-buffer view)))
+                                                                                               (should (eq (buffer-local-value 'ediff-buffer-B control)
+                                                                                                           (claude-code-ide-review-view-file-buffer view)))
+                                                                                               (should (equal (with-current-buffer (claude-code-ide-review-view-old-buffer view)
+                                                                                                                (buffer-string))
+                                                                                                              "one\ntwo\nthree\n"))
+                                                                                               ;; When ediff rebuilds its windows (plain layout on a tty), ours come back
+                                                                                               (with-current-buffer control
+                                                                                                 (ediff-setup-windows ediff-buffer-A ediff-buffer-B nil control))
+                                                                                               (should (equal (mapcar #'caddr (claude-code-ide-review-tests--window-rows))
+                                                                                                              (mapcar #'caddr rows)))
+                                                                                               (claude-code-ide-review-quit)
+                                                                                               (should-not claude-code-ide-review--view)
+                                                                                               (should-not (buffer-live-p control))
+                                                                                               (should-not (get-buffer "*claude-review: baseline a.txt*"))
+                                                                                               (should-not (get-buffer "*claude-review: user*"))
+                                                                                               (should (buffer-live-p (claude-code-ide-review-view-file-buffer view)))
+                                                                                               (should (= (length (window-list)) windows-before))
+                                                                                               ;; Quitting again is harmless
+                                                                                               (claude-code-ide-review-quit))
+                                                                                           (claude-code-ide-review-quit))))))
+
+(ert-deftest claude-code-ide-review-test-ediff-view-current-hunk ()
+  "Each ediff difference maps to the git hunk under it and fills the bottom windows."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-review-tests--with-repo repo
+                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
+                                             (claude-code-ide-review-put-note repo (car hunks) 'claude "Shorter name")
+                                             (claude-code-ide-review-tests--with-view repo "a.txt"
+                                                                                      (let ((view claude-code-ide-review--view))
+                                                                                        (should (= (claude-code-ide-review--difference-count view) 2))
+                                                                                        (should (eql (claude-code-ide-review-view-hunk view) 0))
+                                                                                        (should (equal (claude-code-ide-review--difference-lines view 0) '(2 . 2)))
+                                                                                        (should (equal (claude-code-ide-review--difference-lines view 1) '(4 . 4)))
+                                                                                        (with-current-buffer (claude-code-ide-review-view-claude-buffer view)
+                                                                                          (should (string-prefix-p "a.txt:2-2  ok\nShorter name" (buffer-string))))
+                                                                                        (claude-code-ide-review-next-hunk)
+                                                                                        (should (eql (claude-code-ide-review-view-hunk view) 1))
+                                                                                        (with-current-buffer (claude-code-ide-review-view-claude-buffer view)
+                                                                                          (should (string-prefix-p "a.txt:4-4  unexplained\n" (buffer-string)))
+                                                                                          (should (string-match-p "Claude did not leave a comment" (buffer-string))))
+                                                                                        (claude-code-ide-review-previous-hunk)
+                                                                                        (should (eql (claude-code-ide-review-view-hunk view) 0))
+                                                                                        ;; Selecting by hunk index goes through ediff
+                                                                                        (claude-code-ide-review-select-hunk 1)
+                                                                                        (should (eql (claude-code-ide-review--current-difference view) 1))
+                                                                                        (should (eql (claude-code-ide-review-view-hunk view) 1)))))))
+
+(ert-deftest claude-code-ide-review-test-ediff-view-comment-save ()
+  "The comment window edits the current hunk's note and reloads on switch."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-review-tests--with-repo repo
+                                           (claude-code-ide-review-tests--two-hunks repo)
+                                           (claude-code-ide-review-tests--with-view repo "a.txt"
+                                                                                    (let ((view claude-code-ide-review--view))
+                                                                                      (claude-code-ide-review-tests--type "Keep the word")
+                                                                                      (should (equal (claude-code-ide-review-note-text
+                                                                                                      (claude-code-ide-review-get-note
+                                                                                                       repo (claude-code-ide-review-hunk-id (nth 0 (claude-code-ide-review-view-hunks view))) 'user))
+                                                                                                     "Keep the word"))
+                                                                                      (claude-code-ide-review-next-hunk)
+                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
+                                                                                        (should (string-empty-p (buffer-string)))
+                                                                                        (should-not buffer-read-only))
+                                                                                      (claude-code-ide-review-tests--type "Spell out four")
+                                                                                      (claude-code-ide-review-previous-hunk)
+                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
+                                                                                        (should (equal (buffer-string) "Keep the word"))
+                                                                                        ;; Erasing the comment removes the note
+                                                                                        (erase-buffer))
+                                                                                      (should (= (length (claude-code-ide-review-notes repo 'user)) 1))
+                                                                                      (should (equal (claude-code-ide-review-note-text (car (claude-code-ide-review-notes repo 'user)))
+                                                                                                     "Spell out four"))
+                                                                                      ;; Refresh keeps the comment of the current hunk
+                                                                                      (claude-code-ide-review-next-hunk)
+                                                                                      (claude-code-ide-review-refresh)
+                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 1))
+                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
+                                                                                        (should (equal (buffer-string) "Spell out four")))))))
+
+(ert-deftest claude-code-ide-review-test-ediff-view-select-file ()
+  "Switching files restarts ediff in place and drops the old baseline buffer."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-review-tests--with-repo repo
+                                           (claude-code-ide-review-tests--two-hunks repo)
+                                           (claude-code-ide-review-tests--write repo "b.txt" "beta\n")
+                                           (claude-code-ide-review-tests--with-view repo "a.txt"
+                                                                                    (let ((view claude-code-ide-review--view))
+                                                                                      (claude-code-ide-review-open "b.txt")
+                                                                                      (should (eq claude-code-ide-review--view view))
+                                                                                      (should (equal (claude-code-ide-review-view-file view) "b.txt"))
+                                                                                      (should (buffer-live-p (claude-code-ide-review-view-control view)))
+                                                                                      (should (eq (buffer-local-value 'ediff-buffer-B (claude-code-ide-review-view-control view))
+                                                                                                  (claude-code-ide-review-view-file-buffer view)))
+                                                                                      (should-not (get-buffer "*claude-review: baseline a.txt*"))
+                                                                                      (should (get-buffer "*claude-review: baseline b.txt*"))
+                                                                                      (should (= (length (claude-code-ide-review-tests--window-rows)) 5))
+                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 0))
+                                                                                      (should (equal (claude-code-ide-review--difference-lines view 0) '(1 . 1)))))))
 
 (ert-deftest claude-code-ide-review-test-tool-open-opens-view ()
   "review_open opens the view on the first changed file and says so."
@@ -4074,157 +3888,6 @@ Hunk 1 changes line 2 (two -> 2); hunk 2 appends line 4 (four)."
                                                                                                (should claude-code-ide-review--view)
                                                                                                (should (equal (claude-code-ide-review-view-file claude-code-ide-review--view) "a.txt")))
                                                                                            (claude-code-ide-review-quit))))))
-
-;;; Review Comment Pane Tests
-
-(defun claude-code-ide-review-tests--comment-buffer ()
-  "Return pane 3 of the open view."
-  (nth 3 (claude-code-ide-review-view-buffers claude-code-ide-review--view)))
-
-(defun claude-code-ide-review-tests--type (text)
-  "Insert TEXT at the current comment body's start, as typing would."
-  (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-    (goto-char (claude-code-ide-review-view-body-start claude-code-ide-review--view))
-    (insert text)))
-
-(defun claude-code-ide-review-tests--hunk-ranges (index)
-  "Return hunk INDEX's line range per pane, from the row lists and from the text."
-  (mapcar (lambda (buffer)
-            (with-current-buffer buffer
-              (let ((from-rows (claude-code-ide-review--hunk-line-range
-                                claude-code-ide-review--rows index))
-                    (first nil)
-                    (last nil))
-                (save-excursion
-                  (goto-char (point-min))
-                  (cl-loop for line from 1
-                           until (eobp)
-                           do (when (eql (get-text-property (point) 'claude-review-hunk) index)
-                                (setq first (or first line) last line))
-                           (forward-line 1)))
-                (list from-rows (cons first last)))))
-          (claude-code-ide-review-view-buffers claude-code-ide-review--view)))
-
-(ert-deftest claude-code-ide-review-test-comment-outside-block-is-read-only ()
-  "Only the current hunk's comment body accepts text."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-                                                                                      (should-not buffer-read-only)
-                                                                                      ;; Header line of hunk 0
-                                                                                      (goto-char (point-min))
-                                                                                      (search-forward "#1 a.txt:2-2")
-                                                                                      (should-error (insert "x") :type 'text-read-only)
-                                                                                      ;; Body of hunk 1 while hunk 0 is current
-                                                                                      (let ((other (claude-code-ide-review--body-bounds claude-code-ide-review--rows 1)))
-                                                                                        (goto-char (claude-code-ide-review--line-position (car other)))
-                                                                                        (should-error (insert "x") :type 'text-read-only))
-                                                                                      ;; The closing newline of the current body cannot be deleted
-                                                                                      (goto-char (claude-code-ide-review-view-body-end claude-code-ide-review--view))
-                                                                                      (should-error (delete-char 1) :type 'text-read-only)
-                                                                                      ;; Nor the header's newline before the body
-                                                                                      (goto-char (claude-code-ide-review-view-body-start claude-code-ide-review--view))
-                                                                                      (should-error (delete-char -1) :type 'text-read-only)))))
-
-(ert-deftest claude-code-ide-review-test-comment-saves-note ()
-  "Typing in the body stores a user note; emptying it removes the note."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                      (claude-code-ide-review-tests--type "Keep the word")
-                                                                                      (let ((note (claude-code-ide-review-get-note repo (claude-code-ide-review-hunk-id (nth 0 hunks)) 'user)))
-                                                                                        (should note)
-                                                                                        (should (equal (claude-code-ide-review-note-text note) "Keep the word")))
-                                                                                      (should-not (claude-code-ide-review-get-note repo (claude-code-ide-review-hunk-id (nth 1 hunks)) 'user))
-                                                                                      ;; Point was left at the body start by select-hunk
-                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-                                                                                        (delete-region (claude-code-ide-review-view-body-start claude-code-ide-review--view)
-                                                                                                       (claude-code-ide-review-view-body-end claude-code-ide-review--view)))
-                                                                                      (should-not (claude-code-ide-review-notes repo 'user))))))
-
-(ert-deftest claude-code-ide-review-test-comment-growth-keeps-alignment ()
-  "A growing body first uses pane 3's padding, then pads the other panes."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let* ((view claude-code-ide-review--view)
-                                                                                           (buffers (claude-code-ide-review-view-buffers view))
-                                                                                           (lengths-before (mapcar (lambda (b) (with-current-buffer b (count-lines (point-min) (point-max)))) buffers))
-                                                                                           (budget (let ((r (with-current-buffer (car buffers)
-                                                                                                              (claude-code-ide-review--hunk-line-range claude-code-ide-review--rows 0))))
-                                                                                                     (1+ (- (cdr r) (car r))))))
-                                                                                      ;; The placeholder in pane 2 sets the budget above header + 1 body row
-                                                                                      (should (> budget 2))
-                                                                                      ;; Two extra lines fit inside pane 3's own padding
-                                                                                      (claude-code-ide-review-tests--type "a\nb\nc")
-                                                                                      (should (equal (mapcar (lambda (b) (with-current-buffer b (count-lines (point-min) (point-max)))) buffers)
-                                                                                                     lengths-before))
-                                                                                      ;; Enough lines to exceed the budget lengthen every pane equally
-                                                                                      (claude-code-ide-review-tests--type (make-string (+ budget 2) ?\n))
-                                                                                      (let ((lengths (mapcar (lambda (b) (with-current-buffer b (count-lines (point-min) (point-max)))) buffers)))
-                                                                                        (should (apply #'= lengths))
-                                                                                        (should (> (car lengths) (car lengths-before))))
-                                                                                      (dolist (index '(0 1))
-                                                                                        (let ((ranges (claude-code-ide-review-tests--hunk-ranges index)))
-                                                                                          ;; Row lists agree with the text in every pane, and panes agree with each other
-                                                                                          (dolist (pair ranges)
-                                                                                            (should (equal (car pair) (cadr pair))))
-                                                                                          (should (cl-every (lambda (pair) (equal (car pair) (car (car ranges)))) ranges))))
-                                                                                      ;; The overlays still cover hunk 0's whole block
-                                                                                      (let ((range (with-current-buffer (car buffers)
-                                                                                                     (claude-code-ide-review--hunk-line-range claude-code-ide-review--rows 0))))
-                                                                                        (should (cl-every (lambda (o) (equal o (cons (car range) (1+ (cdr range)))))
-                                                                                                          (claude-code-ide-review-tests--overlay-lines view))))
-                                                                                      ;; Navigation still lands on the right lines
-                                                                                      (claude-code-ide-review-next-hunk)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 1))
-                                                                                      (should (equal (claude-code-ide-review-tests--rows-of
-                                                                                                      (with-current-buffer (nth 1 buffers) claude-code-ide-review--rows) 'added 1)
-                                                                                                     '("four")))))))
-
-(ert-deftest claude-code-ide-review-test-comment-switch-moves-editability ()
-  "Moving to another hunk re-protects the old body and opens the new one."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (let ((hunks (claude-code-ide-review-tests--two-hunks repo)))
-                                             (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                      (let ((view claude-code-ide-review--view))
-                                                                                        (claude-code-ide-review-tests--type "First")
-                                                                                        (claude-code-ide-review-next-hunk)
-                                                                                        (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-                                                                                          ;; Point sits at the new body start
-                                                                                          (should (= (point) (marker-position (claude-code-ide-review-view-body-start view))))
-                                                                                          ;; The old body is read-only again
-                                                                                          (goto-char (point-min))
-                                                                                          (search-forward "First")
-                                                                                          (should-error (insert "x") :type 'text-read-only))
-                                                                                        (claude-code-ide-review-tests--type "Second")
-                                                                                        (should (equal (claude-code-ide-review-note-text
-                                                                                                        (claude-code-ide-review-get-note repo (claude-code-ide-review-hunk-id (nth 1 hunks)) 'user))
-                                                                                                       "Second"))
-                                                                                        (should (equal (claude-code-ide-review-note-text
-                                                                                                        (claude-code-ide-review-get-note repo (claude-code-ide-review-hunk-id (nth 0 hunks)) 'user))
-                                                                                                       "First")))))))
-
-(ert-deftest claude-code-ide-review-test-comment-survives-refresh ()
-  "A typed comment is restored from the note table after a refresh."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let ((view claude-code-ide-review--view))
-                                                                                      (claude-code-ide-review-next-hunk)
-                                                                                      (claude-code-ide-review-tests--type "Spell out four")
-                                                                                      (claude-code-ide-review-refresh)
-                                                                                      (should (eql (claude-code-ide-review-view-hunk view) 1))
-                                                                                      (should (equal (claude-code-ide-review--body-text view) "Spell out four"))
-                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-                                                                                        (should (equal (claude-code-ide-review-tests--rows-of claude-code-ide-review--rows 'note 1)
-                                                                                                       '("Spell out four"))))))))
 
 ;;; Review Finish and Explain Tests
 
@@ -4292,10 +3955,10 @@ files of REPO are killed afterwards so the directory can be deleted."
                                                                                                                                        ;; The comments are still shown
                                                                                                                                        (should (= (length (claude-code-ide-review-notes repo 'user)) 2))
                                                                                                                                        ;; Editing a sent comment makes it unsent again
-                                                                                                                                       (claude-code-ide-review-tests--type "Please ")
+                                                                                                                                       (claude-code-ide-review-tests--type " please")
                                                                                                                                        (should (= (length (claude-code-ide-review-unsent-comments repo)) 1))
                                                                                                                                        (should (equal (claude-code-ide-review-note-text (car (claude-code-ide-review-unsent-comments repo)))
-                                                                                                                                                      "Please Spell out four"))))))
+                                                                                                                                                      "Spell out four please"))))))
 
 (ert-deftest claude-code-ide-review-test-finish-uses-tool-above-limit ()
   "Above the inline limit the prompt asks for review_get_comments instead."
@@ -4403,10 +4066,8 @@ files of REPO are killed afterwards so the directory can be deleted."
     (claude-code-ide-review-mode)
     ;; `substitute-command-keys' renders the key quoted or face-marked
     ;; depending on the Emacs version; the key itself must be there
-    (should (string-match-p "press `?e'? here"
-                            (mapconcat #'claude-code-ide-review-row-text
-                                       (claude-code-ide-review--placeholder-rows 0)
-                                       " ")))))
+    (should (string-match-p "press `?e'? in the diff"
+                            (claude-code-ide-review--placeholder-text)))))
 
 ;;; Review Live Sync Tests
 
@@ -4482,9 +4143,10 @@ files of REPO are killed afterwards so the directory can be deleted."
                                                                                           (should (equal (mapcar #'cadr statuses) '(stale ok)))
                                                                                           (should (equal (claude-code-ide-review-note-text (nth 2 (car statuses)))
                                                                                                          "Shorter name")))
-                                                                                        (with-current-buffer (nth 1 (claude-code-ide-review-view-buffers view))
-                                                                                          (should (member "22" (claude-code-ide-review-tests--rows-of
-                                                                                                                claude-code-ide-review--rows 'added 0)))))))))
+                                                                                        ;; The file buffer was reverted and ediff recomputed
+                                                                                        (with-current-buffer (claude-code-ide-review-view-file-buffer view)
+                                                                                          (should (string-match-p "^22$" (buffer-string))))
+                                                                                        (should (= (claude-code-ide-review--difference-count view) 2)))))))
 
 (ert-deftest claude-code-ide-review-test-sync-ignores-other-files ()
   "Events for other files, or irrelevant actions, schedule nothing."
@@ -4499,26 +4161,6 @@ files of REPO are killed afterwards so the directory can be deleted."
                                                                                       (claude-code-ide-review--on-file-event
                                                                                        (list nil 'stopped (expand-file-name "a.txt" repo)))
                                                                                       (should-not (claude-code-ide-review-view-timer view))))))
-
-(ert-deftest claude-code-ide-review-test-sync-keeps-comment-point ()
-  "A rebuild keeps point at its offset in the comment body."
-  (skip-unless (executable-find "git"))
-  (claude-code-ide-review-tests--with-repo repo
-                                           (claude-code-ide-review-tests--two-hunks repo)
-                                           (claude-code-ide-review-tests--with-view repo "a.txt"
-                                                                                    (let ((view claude-code-ide-review--view))
-                                                                                      (claude-code-ide-review-tests--type "Keep the word")
-                                                                                      (with-current-buffer (claude-code-ide-review-tests--comment-buffer)
-                                                                                        (goto-char (+ (claude-code-ide-review-view-body-start view) 4))
-                                                                                        (claude-code-ide-review-refresh)
-                                                                                        (should (equal (claude-code-ide-review--body-text view) "Keep the word"))
-                                                                                        (should (= (point) (+ (claude-code-ide-review-view-body-start view) 4)))
-                                                                                        (should (= (window-point (nth 3 (claude-code-ide-review-view-windows view)))
-                                                                                                   (point)))
-                                                                                        ;; Outside the body, a rebuild puts point at the body start as before
-                                                                                        (goto-char (point-min))
-                                                                                        (claude-code-ide-review-refresh)
-                                                                                        (should (= (point) (claude-code-ide-review-view-body-start view))))))))
 
 (ert-deftest claude-code-ide-review-test-refresh-reports-reverted-file ()
   "When the shown file has no changes left, refresh names another changed file."
@@ -4577,10 +4219,13 @@ files of REPO are killed afterwards so the directory can be deleted."
   (let ((claude-code-ide-mcp-server-tools nil)
         (claude-code-ide-mcp-server-prompts nil)
         (claude-code-ide-system-prompt-functions nil)
+        (claude-code-ide-command-flag-functions nil)
+        (claude-code-ide-enable-mcp-server nil)
         (claude-code-ide-mcp-server-session-started-hook nil)
         (claude-code-ide-mcp-server-session-ended-hook nil))
     (claude-code-ide-review-setup)
     (claude-code-ide-review-setup)
+    (should claude-code-ide-enable-mcp-server)
     (should (= (length claude-code-ide-mcp-server-tools) 5))
     (should (= (length claude-code-ide-mcp-server-prompts) 1))
     (should (equal (plist-get (car claude-code-ide-mcp-server-prompts) :name) "review"))

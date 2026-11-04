@@ -224,7 +224,7 @@ The flow is: enable the feature once, let Claude work, open the review, read eac
 (claude-code-ide-review-setup)
 #+end_src
 
-This registers five MCP tools (listed below), the =/emacs-tools:review (MCP)= slash command, and a hook that records a baseline of the working tree when the first Claude session of a project starts. The baseline is a hidden git commit under =refs/claude-review/=; it is removed when Emacs exits and is never part of your branch. Files ignored by git and untracked files above =claude-code-ide-review-max-file-size= are left out.
+This enables the Emacs MCP tools server (=claude-code-ide-enable-mcp-server=) and registers five MCP tools (listed below), the =/emacs-tools:review (MCP)= slash command, and a hook that records a baseline of the working tree when the first Claude session of a project starts. Sessions started before this call do not have the tools; start a new one. The baseline is a hidden git commit under =refs/claude-review/=; it is removed when Emacs exits and is never part of your branch. Files ignored by git and untracked files above =claude-code-ide-review-max-file-size= are left out.
 
 *** Opening the view
 
